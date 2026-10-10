@@ -27,7 +27,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-m68k = "0.7"
+m68k = "0.14.3"
 ```
 
 The default build has no JIT compiler dependency. Native applications that use
@@ -35,7 +35,7 @@ The default build has no JIT compiler dependency. Native applications that use
 
 ```toml
 [dependencies]
-m68k = { version = "0.7", features = ["jit"] }
+m68k = { version = "0.14.3", features = ["jit"] }
 ```
 
 With `jit` enabled on x86-64, eligible indirect-dispatch loops and short
