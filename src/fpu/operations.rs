@@ -643,17 +643,20 @@ impl CpuCore {
 
     /// 68060 FSAVE: the floating-point state frame carries its format in
     /// bits 15:8 of the first long word: $00 = NULL (FPU untouched since
-    /// reset), $60 = IDLE. A NULL frame is a single long word - the same
-    /// one-long NULL used since the 68881, while IDLE occupies the full three
-    /// long words. The EXCP frame ($E0, carrying pending-
+    /// reset), $60 = IDLE. Every frame occupies three long words, including
+    /// NULL (MC68060UM, section 6.7, pp. 6-35–6-36; appendix D, FSAVE).
+    /// The four-byte
+    /// NULL frame used by earlier FPUs does not apply to the 68060.
+    /// The EXCP frame ($E0, carrying pending-
     /// exception operands) is not modeled: the softfloat FPU completes
     /// every operation before retiring.
     fn exec_fsave_060<B: AddressBus>(&mut self, bus: &mut B, ea_mode: u8, ea_reg: usize) -> i32 {
-        let (header, size): (u32, u32) = if self.fpu_just_reset {
-            (0x0000_0000, 4)
+        let header = if self.fpu_just_reset {
+            0x0000_0000
         } else {
-            (0x0000_6000, 12)
+            0x0000_6000
         };
+        let size = 12;
         match ea_mode {
             2 | 3 => {
                 // (An) / (An)+
@@ -692,20 +695,20 @@ impl CpuCore {
         }
     }
 
-    /// 68060 FRESTORE: size the frame from the format byte - one long word
-    /// for NULL (resetting the FPU), three for anything else. Kickstart's
-    /// exec builds initial task contexts by hand with a one-long NULL frame
-    /// and launches them through FRESTORE (An)+, so a fixed 12-byte read
-    /// would skew the context walk and launch the first task at PC 0.
+    /// 68060 FRESTORE always consumes three long words, including NULL
+    /// (MC68060UM, appendix D, FRESTORE). Firmware must hide the 060 FPU
+    /// from operating systems that construct earlier FPUs' four-byte frames
+    /// until their 68060 support library installs compatible task contexts.
     fn exec_frestore_060<B: AddressBus>(&mut self, bus: &mut B, ea_mode: u8, ea_reg: usize) -> i32 {
         match ea_mode {
             2 | 3 => {
                 let addr = self.a(ea_reg);
                 let header = self.read_32(bus, addr);
+                let _ = self.read_32(bus, addr.wrapping_add(4));
+                let _ = self.read_32(bus, addr.wrapping_add(8));
                 let null_frame = (header & 0x0000_FF00) == 0;
                 if ea_mode == 3 {
-                    let size = if null_frame { 4 } else { 12 };
-                    self.set_a(ea_reg, addr.wrapping_add(size));
+                    self.set_a(ea_reg, addr.wrapping_add(12));
                 }
                 if null_frame {
                     self.do_frestore_null();
@@ -720,6 +723,8 @@ impl CpuCore {
             _ => match self.fpu_frame_control_ea(bus, ea_mode, ea_reg, true) {
                 Some(addr) => {
                     let header = self.read_32(bus, addr);
+                    let _ = self.read_32(bus, addr.wrapping_add(4));
+                    let _ = self.read_32(bus, addr.wrapping_add(8));
                     if (header & 0x0000_FF00) == 0 {
                         self.do_frestore_null();
                     } else {

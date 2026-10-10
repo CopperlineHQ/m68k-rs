@@ -8,12 +8,14 @@ use m68k::{CpuCore, CpuType, NoOpHleHandler, StepResult};
 
 struct TestBus {
     memory: Vec<u8>,
+    long_reads: Vec<u32>,
 }
 
 impl TestBus {
     fn new() -> Self {
         Self {
             memory: vec![0; 0x10000],
+            long_reads: Vec::new(),
         }
     }
 
@@ -51,6 +53,7 @@ impl AddressBus for TestBus {
     }
 
     fn read_long(&mut self, address: u32) -> u32 {
+        self.long_reads.push(address);
         let addr = (address as usize) & 0xFFFF;
         u32::from_be_bytes([
             self.memory[addr],
@@ -532,13 +535,20 @@ fn pcr_dfp_takes_the_disabled_frame_on_68060() {
 #[test]
 fn fsave_writes_060_frames_and_frestore_null_resets() {
     let (mut cpu, mut bus) = setup_060();
-    // FSAVE -(A0) straight after reset: one-long NULL frame (the size
-    // AmigaOS's hand-built task contexts rely on).
+    // MC68060UM section 6.7 (pp. 6-35–6-36): even a NULL frame has
+    // three long words, unlike the NULL frames of earlier FPUs.
     bus.write_word_at(0x0200, 0xF320);
     cpu.dar[8] = 0x5000;
+    for address in (0x4FF0..=0x5000).step_by(4) {
+        bus.write_long_at(address, 0xDEAD_BEEF);
+    }
     step(&mut cpu, &mut bus);
-    assert_eq!(cpu.dar[8], 0x4FFC, "NULL state frame is one long word");
-    assert_eq!(bus.read_long(0x4FFC), 0, "NULL frame after reset");
+    assert_eq!(cpu.dar[8], 0x4FF4, "NULL state frame is 12 bytes");
+    assert_eq!(bus.read_long(0x4FF0), 0xDEAD_BEEF);
+    for address in (0x4FF4..0x5000).step_by(4) {
+        assert_eq!(bus.read_long(address), 0, "NULL frame after reset");
+    }
+    assert_eq!(bus.read_long(0x5000), 0xDEAD_BEEF);
 
     // Touch the FPU, then FSAVE again: 12-byte IDLE frame (format $60).
     bus.write_word_at(0x0202, 0xF200); // FADD.X FP0,FP1
@@ -546,17 +556,16 @@ fn fsave_writes_060_frames_and_frestore_null_resets() {
     bus.write_word_at(0x0206, 0xF320); // FSAVE -(A0)
     step(&mut cpu, &mut bus);
     step(&mut cpu, &mut bus);
-    assert_eq!(cpu.dar[8], 0x4FF0, "IDLE state frame is 12 bytes");
-    assert_eq!(bus.read_long(0x4FF0), 0x0000_6000, "IDLE frame format $60");
+    assert_eq!(cpu.dar[8], 0x4FE8, "IDLE state frame is 12 bytes");
+    assert_eq!(bus.read_long(0x4FE8), 0x0000_6000, "IDLE frame format $60");
 
-    // FRESTORE (A0)+ sizes the frame from the format byte: a NULL frame
-    // consumes one long and resets the FPU.
+    // FRESTORE (A0)+ consumes all three NULL frame words and resets the FPU.
     cpu.fpcr = 0x1234;
     bus.write_long_at(0x6000, 0);
     bus.write_word_at(0x0208, 0xF358); // FRESTORE (A0)+
     cpu.dar[8] = 0x6000;
     step(&mut cpu, &mut bus);
-    assert_eq!(cpu.dar[8], 0x6004, "NULL FRESTORE consumes one long");
+    assert_eq!(cpu.dar[8], 0x600C, "NULL FRESTORE consumes 12 bytes");
     assert_eq!(cpu.fpcr, 0, "NULL frame resets the FPU");
 
     // An IDLE frame consumes the full 12 bytes.
@@ -565,6 +574,70 @@ fn fsave_writes_060_frames_and_frestore_null_resets() {
     cpu.dar[8] = 0x7000;
     step(&mut cpu, &mut bus);
     assert_eq!(cpu.dar[8], 0x700C, "IDLE FRESTORE consumes 12 bytes");
+}
+
+#[test]
+fn frestore_null_preserves_the_following_saved_context() {
+    let (mut cpu, mut bus) = setup_060();
+    cpu.dar[13] = 0x6000; // A5 points to an externally constructed frame.
+    for address in (0x6000..0x600C).step_by(4) {
+        bus.write_long_at(address, 0);
+    }
+    bus.write_long_at(0x600C, 0x1234_5678); // saved PC
+    bus.write_word_at(0x6010, 0x2700); // saved SR
+    bus.write_word_at(0x0200, 0xF35D); // FRESTORE (A5)+
+    bus.write_word_at(0x0202, 0x201D); // MOVE.L (A5)+,D0
+    bus.write_word_at(0x0204, 0x321D); // MOVE.W (A5)+,D1
+    step(&mut cpu, &mut bus);
+    step(&mut cpu, &mut bus);
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.dar[0], 0x1234_5678);
+    assert_eq!(cpu.dar[1] & 0xFFFF, 0x2700);
+    assert_eq!(cpu.dar[13], 0x6012);
+}
+
+#[test]
+fn null_frames_cover_control_effective_addresses() {
+    // (A0), d16(A0), and absolute long: unlike predecrement/postincrement,
+    // these paths must access the complete frame without changing A0.
+    for (save, restore, extensions) in [
+        (0xF310, 0xF350, vec![]),
+        (0xF328, 0xF368, vec![0x0010]),
+        (0xF339, 0xF379, vec![0x0000, 0x6000]),
+    ] {
+        let (mut cpu, mut bus) = setup_060();
+        let a0 = if save == 0xF328 { 0x5FF0 } else { 0x6000 };
+        cpu.dar[8] = a0;
+        for address in (0x5FFC..=0x600C).step_by(4) {
+            bus.write_long_at(address, 0xDEAD_BEEF);
+        }
+        bus.write_word_at(0x0200, save);
+        for (index, word) in extensions.iter().enumerate() {
+            bus.write_word_at(0x0202 + index as u32 * 2, *word);
+        }
+        step(&mut cpu, &mut bus);
+        assert_eq!(cpu.dar[8], a0);
+        assert_eq!(bus.read_long_at(0x5FFC), 0xDEAD_BEEF);
+        for address in (0x6000..0x600C).step_by(4) {
+            assert_eq!(bus.read_long_at(address), 0);
+        }
+        assert_eq!(bus.read_long_at(0x600C), 0xDEAD_BEEF);
+
+        cpu.pc = 0x0200;
+        cpu.fpcr = 0x1234;
+        bus.write_word_at(0x0200, restore);
+        bus.long_reads.clear();
+        step(&mut cpu, &mut bus);
+        assert_eq!(cpu.dar[8], a0);
+        assert_eq!(cpu.fpcr, 0);
+        let frame_reads: Vec<_> = bus
+            .long_reads
+            .iter()
+            .copied()
+            .filter(|address| (0x6000..0x600C).contains(address))
+            .collect();
+        assert_eq!(frame_reads, [0x6000, 0x6004, 0x6008]);
+    }
 }
 
 /// Identity-map the 4 KB page containing `logical` through a 68040-style
