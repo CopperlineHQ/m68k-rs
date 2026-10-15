@@ -366,6 +366,12 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         }
     }
 
+    // PCR.DFP (always set on an LC/EC060) disables the whole 060 FPU, the
+    // conditionals below included: they take the FPU-disabled exception
+    // ahead of the unimplemented-instruction trap, before reading any
+    // extension word. exec_fpu_op0/op1 check it for the other FP opcodes.
+    let fpu_disabled_060 = cpu.is_060() && (cpu.pcr & super::cpu::PCR_DFP) != 0;
+
     // The 0xF240-0xF27F block splits on the EA-mode field:
     //   mode 001          -> FDBcc Dn,disp
     //   mode 111, reg 2-4 -> FTRAPcc (.W / .L / no operand)
@@ -376,6 +382,9 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         // Mode 111 regs 5-7 are undefined encodings in this block.
         if ea_mode == 7 && ea_reg > 4 {
             return exception_1111(cpu, opcode);
+        }
+        if fpu_disabled_060 {
+            return cpu.take_fp_disabled_060(bus);
         }
         let w2 = cpu.read_imm_16(bus);
         let cond = (w2 & 0x3F) as u8;
@@ -409,6 +418,9 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
 
     // FBcc.W: 1111 0010 10cc cccc (0xF280-0xF2BF)
     // FBcc.L: 1111 0010 11cc cccc (0xF2C0-0xF2FF)
+    if (opcode & 0xFF80) == 0xF280 && fpu_disabled_060 {
+        return cpu.take_fp_disabled_060(bus);
+    }
     if (opcode & 0xFFC0) == 0xF280 {
         // FBcc.W - 16-bit displacement
         let cond = (opcode & 0x3F) as u8;

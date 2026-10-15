@@ -210,10 +210,13 @@ pub struct CpuCore {
     pub is_pre_68020: bool,
     /// FPU just reset
     pub fpu_just_reset: bool,
-    /// Whether a floating-point coprocessor is attached (68020/030 with an
-    /// external 68881/68882). When false, cpID-1 F-line operations raise
-    /// Line-F. The 040/060 model FPU absence separately (EC/LC types and
-    /// PCR.DFP), so this stays true for them.
+    /// Whether a floating-point unit is fitted. On the 68020/030 it says
+    /// whether an external 68881/68882 is attached; when false, cpID-1
+    /// F-line operations raise Line-F. The 040 models FPU absence through
+    /// its EC/LC types instead, so this stays true for it. On the 060,
+    /// false selects the FPU-less MC68LC060/MC68EC060: reset loads their
+    /// PCR identification ($0431) and PCR.DFP stays set, so every FP
+    /// instruction takes the FPU-disabled exception. Set it before reset.
     pub fpu_present: bool,
     /// Reset cycles counter
     pub reset_cycles: u32,
@@ -479,6 +482,10 @@ pub const PCR_EDEBUG: u32 = 1 << 7;
 /// Reset value: identification 0x0430 (full MC68060), revision 1, ESS and
 /// DFP clear (superscalar dispatch off until system software enables it).
 pub const PCR_060_RESET: u32 = 0x0430_0100;
+/// Reset value of the FPU-less MC68LC060/MC68EC060 (`fpu_present` false):
+/// identification 0x0431, revision 1, ESS clear, and DFP set. These parts
+/// have no FPU to enable, so DFP stays set across MOVEC writes.
+pub const PCR_EC060_RESET: u32 = 0x0431_0100 | PCR_DFP;
 
 impl Default for CpuCore {
     fn default() -> Self {
@@ -760,9 +767,14 @@ impl CpuCore {
         self.cacr = 0;
         self.cacr_pending_ops |= CACR_CI | CACR_CD;
         // 68060 control registers: identification/revision persist, the
-        // writable bits (EDEBUG/DFP/ESS) clear. Reset invalidates the
-        // branch cache along with the other caches.
-        self.pcr = PCR_060_RESET;
+        // writable bits (EDEBUG/DFP/ESS) clear, except that an FPU-less
+        // part holds DFP set. Reset invalidates the branch cache along
+        // with the other caches.
+        self.pcr = if self.fpu_present {
+            PCR_060_RESET
+        } else {
+            PCR_EC060_RESET
+        };
         self.buscr = 0;
         self.oep060.branch_cache.clear_all();
         // Reset disables address translation: the TC enable bit and the
@@ -1303,9 +1315,13 @@ impl CpuCore {
             0x807 => self.mmu_srp_aptr = value, // Supervisor Root Pointer (68040)
             0x808 if self.is_060() => {
                 // PCR: identification and revision are read-only; only
-                // EDEBUG, DFP, and ESS are writable.
+                // EDEBUG, DFP, and ESS are writable. The FPU-less LC/EC060
+                // holds DFP set: clearing it cannot enable an absent FPU.
                 let writable = PCR_EDEBUG | PCR_DFP | PCR_ESS;
                 self.pcr = (self.pcr & !writable) | (value & writable);
+                if !self.fpu_present {
+                    self.pcr |= PCR_DFP;
+                }
             }
             _ => {} // Unknown register - ignore
         }
