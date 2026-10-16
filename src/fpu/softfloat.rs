@@ -139,11 +139,13 @@ fn unpack(x: FloatX80) -> Unpacked {
     let sign = x.sign();
     let biased = x.biased_exp();
     if biased == 0 {
-        // Denormal: normalize so the integer bit reaches bit 63.
+        // Denormal: normalize so the integer bit reaches bit 63. Unlike the
+        // x87, the MC68881 does not treat a biased exponent of 0 as 1: the
+        // value is mantissa * 2^(-BIAS-63), integer bit included.
         let lz = x.mantissa.leading_zeros();
         Unpacked {
             sign,
-            exp: (1 - BIAS) - lz as i32,
+            exp: -BIAS - lz as i32,
             mant: x.mantissa << lz,
         }
     } else {
@@ -200,11 +202,12 @@ fn round_pack(sign: bool, mut exp: i32, mut m: u128, ctx: RoundCtx, f: &mut ExcF
 
     let mut biased = exp + BIAS;
 
-    // Denormalize if the exponent is below the format minimum (biased < 1).
-    if biased < 1 {
-        let sh = (1 - biased) as u32;
+    // Denormalize if the exponent is below the format minimum. That is a
+    // biased exponent of 0, which holds the integer bit like any other.
+    if biased < 0 {
+        let sh = (-biased) as u32;
         m = shift_right_sticky(m, sh);
-        biased = 1;
+        biased = 0;
     }
 
     let p = ctx.prec.bits();
@@ -419,17 +422,21 @@ pub fn div(a: FloatX80, b: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX8
     }
     let ua = unpack(a);
     let ub = unpack(b);
-    // q = floor((mant_a / mant_b) * 2^64): the ratio with 64 fraction bits.
+    // The ratio of two normalized mantissas is in (1/2, 2). 64 fraction bits
+    // leave no guard bit when it is below 1, so divide the remainder again:
+    // q1 = floor(ratio * 2^64), q2 = the next 64 bits.
+    let mb = ub.mant as u128;
     let num = (ua.mant as u128) << 64;
-    let q = num / (ub.mant as u128);
-    let rem = num % (ub.mant as u128);
-    // Place the ratio's integer bit at bit 127 so the 64 fraction bits become
-    // the guard/round window; carry a sticky from the division remainder.
-    let mut m = q << 63;
-    if rem != 0 {
+    let q1 = num / mb;
+    let r1 = num % mb;
+    let q2 = (r1 << 64) / mb;
+    let r2 = (r1 << 64) % mb;
+    // q1 has at most 65 bits: m = ratio * 2^126, so bit 127 stands for 2^1.
+    let mut m = (q1 << 62) | (q2 >> 2);
+    if (q2 & 3) != 0 || r2 != 0 {
         m |= 1;
     }
-    round_pack(sign, ua.exp - ub.exp, m, ctx, f)
+    round_pack(sign, ua.exp - ub.exp + 1, m, ctx, f)
 }
 
 // ============================== sqrt =====================================
@@ -484,8 +491,13 @@ pub fn sqrt(a: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     let radicand = (ua.mant as u128) << s;
     let (root, remb) = isqrt128(radicand);
     let mut m = root << 64; // integer bit at bit 127
-    if remb != 0 {
-        m |= 1; // sticky
+    // The root has no guard bit: sqrt > root + 1/2 exactly when the
+    // remainder exceeds root ((root + 1/2)^2 = root^2 + root + 1/4), and
+    // there are no ties.
+    if remb > root {
+        m |= (1u128 << 63) | 1; // above half
+    } else if remb != 0 {
+        m |= 1; // below half
     }
     // value = root * 2^(big_e/2); round_pack wants exp of bit127 = big_e/2 + 63.
     round_pack(false, big_e / 2 + 63, m, ctx, f)
@@ -772,6 +784,45 @@ mod tests {
                 assert_eq!(div(x(a), x(b), rn(), &mut f).to_f64(), a / b, "{a}/{b}");
             }
         }
+    }
+
+    /// A biased exponent of 0 is 2^-16383 on the MC68881 (no x87-style bump
+    /// to 1), and it holds normal numbers with the integer bit set.
+    #[test]
+    fn biased_exponent_zero_is_two_to_minus_16383() {
+        let mut f = ExcFlags::default();
+        let fx = |sign_exp: u16, mantissa: u64| FloatX80 { sign_exp, mantissa };
+        let m = fx(0, 0x8000_0000_0000_0000); // 2^-16383
+        let e1 = fx(1, 0x8000_0000_0000_0000); // 2^-16382
+        let tiny = fx(0, 1); // 2^-16446
+        let one = x(1.0);
+        assert_eq!(mul(m, one, rn(), &mut f), m);
+        assert_eq!(mul(e1, x(0.5), rn(), &mut f), m);
+        assert_eq!(add(m, m, rn(), &mut f), e1);
+        assert_eq!(div(m, x(0.5), rn(), &mut f), e1);
+        assert_eq!(mul(tiny, one, rn(), &mut f), tiny);
+        assert_eq!(mul(tiny, x(2.0), rn(), &mut f), fx(0, 2));
+        assert_eq!(sub(e1, tiny, rn(), &mut f), fx(0, 0xFFFF_FFFF_FFFF_FFFF));
+    }
+
+    /// Quotients below 1 and square roots have no guard bit in a 64-bit
+    /// first step; both must still round to nearest, not truncate.
+    #[test]
+    fn div_and_sqrt_round_to_nearest() {
+        let mut f = ExcFlags::default();
+        let fx = |sign_exp: u16, mantissa: u64| FloatX80 { sign_exp, mantissa };
+        assert_eq!(
+            div(x(1.0), x(3.0), rn(), &mut f),
+            fx(0x3FFD, 0xAAAA_AAAA_AAAA_AAAB)
+        );
+        assert_eq!(
+            div(x(2.0), x(3.0), rn(), &mut f),
+            fx(0x3FFE, 0xAAAA_AAAA_AAAA_AAAB)
+        );
+        assert_eq!(
+            sqrt(x(3.0), rn(), &mut f),
+            fx(0x3FFF, 0xDDB3_D742_C265_539E)
+        );
     }
 
     #[test]
