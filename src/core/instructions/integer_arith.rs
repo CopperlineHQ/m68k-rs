@@ -3,7 +3,7 @@
 //! ADD, ADDA, ADDQ, ADDX, SUB, SUBA, SUBQ, SUBX, CMP, CMPA, NEG, NEGX, CLR, EXT
 
 use crate::core::cpu::{CFLAG_SET, CpuCore, VFLAG_SET};
-use crate::core::ea::AddressingMode;
+use crate::core::ea::{AddressingMode, EaResult};
 use crate::core::execute::RUN_MODE_BERR_AERR_RESET;
 use crate::core::memory::AddressBus;
 use crate::core::types::{CpuType, Size};
@@ -495,10 +495,35 @@ impl CpuCore {
         mode: AddressingMode,
     ) -> i32 {
         let ea = self.resolve_ea(bus, mode, size);
-        let value = self.read_resolved_ea(bus, ea, size);
+        // The MC68000 TST.L poll rides the low word cycle. Its generic long
+        // read is one host callback, so split this instruction's operand here
+        // to let a timing-aware bus sample IPL at both word-cycle starts.
+        let value = if self.cpu_type == CpuType::M68000 && size == Size::Long {
+            if let EaResult::Memory(addr) = ea {
+                let hi = self.read_16(bus, addr) as u32;
+                if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+                    return 50;
+                }
+                let lo = self.read_16(bus, addr.wrapping_add(2)) as u32;
+                (hi << 16) | lo
+            } else {
+                self.read_resolved_ea(bus, ea, size)
+            }
+        } else {
+            self.read_resolved_ea(bus, ea, size)
+        };
         if self.run_mode == RUN_MODE_BERR_AERR_RESET {
             // Address/bus error while reading the operand: exception has been taken.
             return 50;
+        }
+        // MC68000 TST polls IPL on its operand read. The final prefetch is
+        // later, so preserve the operand access's sample for the instruction
+        // boundary. Register and immediate forms poll at their usual boundary.
+        if self.cpu_type == CpuType::M68000
+            && self.prefetch_enabled()
+            && matches!(ea, EaResult::Memory(_))
+        {
+            bus.ipl_hold_operand_sample();
         }
         self.set_logic_flags(value, size);
         4 + self.ea_time(mode, size)

@@ -6,6 +6,7 @@
 //! `tests/fixtures/m68000`, or point `M68K_SST_FIXTURES` at the clone's
 //! `v1` directory (what CI does). See `tests/fixtures/README.md`.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -767,7 +768,7 @@ fn cycle_gap_report() {
             "ea_mode", "fixture", "cpu", "count"
         );
         let mut rows: Vec<_> = detail.iter().collect();
-        rows.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        rows.sort_by_key(|row| Reverse(row.1.0));
         for ((ea_mode, fix, cpu), (count, opcode)) in rows.iter().take(30) {
             println!("{ea_mode:>7} {fix:>9} {cpu:>9} {count:>8}  {opcode:#06X}");
         }

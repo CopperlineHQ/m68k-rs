@@ -129,6 +129,18 @@ fn main() {
 }
 ```
 
+For cycle-accurate MC68000 interrupt integration, the host must retain the
+instruction's IPL sample until its boundary interrupt decision. Ordinary
+polls use a bus access's sample; `AddressBus::ipl_hold_sample` retains an
+earlier access when necessary. `AddressBus::ipl_poll_internal` instead takes
+and retains a **fresh** sample at the current synchronized internal-cycle
+boundary. DIVS uses this for a nonnegative dividend and negative divisor,
+except early absolute overflow: the poll precedes the final prefetch by two
+CPU clocks, while the fetch position and total instruction duration stay
+unchanged. Timing-aware hosts must implement this hook; its default is a
+no-op for functional buses. Exception dispatch releases either sample hold
+through `AddressBus::ipl_release_sample`.
+
 ### High-Level Emulation (HLE)
 
 Intercept traps for OS emulation or debugger integration with CPU/bus access:

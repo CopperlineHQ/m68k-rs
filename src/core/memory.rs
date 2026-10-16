@@ -325,6 +325,29 @@ pub trait AddressBus {
     /// consumes it. Functional-only buses can ignore it.
     fn ipl_hold_sample(&mut self) {}
 
+    /// MC68000 memory TST poll point. Timing-aware buses may qualify the
+    /// operand-word IPL sample differently from the ordinary poll hold (for
+    /// example, where a trailing-prefetch IPL qualifier does not apply).
+    /// The default preserves existing host behavior.
+    #[inline]
+    fn ipl_hold_operand_sample(&mut self) {
+        self.ipl_hold_sample();
+    }
+
+    /// Sample IPL at the current internal-cycle boundary and hold that fresh
+    /// sample for the next instruction-boundary interrupt decision. Unlike
+    /// `ipl_hold_sample`, this must not reuse a preceding bus access's sample.
+    /// Subsequent accesses must not replace it until the host consumes it or
+    /// the core calls `ipl_release_sample` during exception dispatch.
+    ///
+    /// The MC68000 uses this for DIVS with a nonnegative dividend and negative
+    /// divisor (except early absolute overflow): IPL is sampled two CPU clocks
+    /// before the final prefetch, without moving that prefetch. The core flushes
+    /// internal clocks through `sync` before calling this method. Timing-aware
+    /// hosts must implement the fresh sample and hold; functional buses may
+    /// keep the default no-op.
+    fn ipl_poll_internal(&mut self) {}
+
     /// Release an `ipl_hold_sample` poll-point hold before the instruction
     /// boundary consumes it. Called on exception dispatch: the vector jump's
     /// handler-entry prefetch is a fresh poll point on real silicon (Moira
