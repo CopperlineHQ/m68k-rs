@@ -113,6 +113,7 @@ fn raw_state(cpu: &CpuCore) -> Vec<(&'static str, String)> {
         pcr,
         buscr,
         atc,
+        atc_030,
         pending_fault_cause,
         mmu_fc_override,
         mmu_read_override,

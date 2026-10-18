@@ -2,9 +2,11 @@
 //!
 //! The 68030 path implements its programmable multi-level table format,
 //! CRP/SRP selection, function-code lookup, transparent translation, PTEST,
-//! and accumulated write/supervisor protection. The 68040 and 68060 use the
-//! fixed root/pointer/page table format, instruction/data transparent
-//! translation registers, and a direct-mapped address-translation cache.
+//! accumulated write/supervisor protection, and its 22-entry fully
+//! associative address-translation cache (flushed by PFLUSH and PMOVE). The
+//! 68040 and 68060 use the fixed root/pointer/page table format,
+//! instruction/data transparent translation registers, and a direct-mapped
+//! address-translation cache.
 //!
 //! Table-walk bus errors and protection failures retain enough cause detail
 //! for generation-specific exception frames. Used/modified descriptor
@@ -18,9 +20,9 @@ pub mod ttr;
 use crate::core::cpu::CpuCore;
 use crate::core::memory::AddressBus;
 
-pub use atc::Atc;
-pub(crate) use translation::ptest_030;
+pub use atc::{Atc, Atc030};
 pub use translation::translate;
+pub(crate) use translation::{pload_030, ptest_030};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Architectural class of an MMU operation or translation fault.

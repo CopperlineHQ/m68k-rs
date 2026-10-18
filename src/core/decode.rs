@@ -329,8 +329,8 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         // PFLUSH variants flush the ATC. We do not track entries finely enough
         // to honour the per-page / (An) scope, so every variant flushes all;
         // this is always coherent (over-flushing only costs re-walks). The
-        // 68030 PFLUSH forms come through exec_mmu_op0 (0xF0xx) and the 030
-        // walker does not consult the ATC, so nothing to flush there.
+        // 68030 PFLUSH forms come through exec_mmu_op0 (0xF0xx), which keeps
+        // the 030's own ATC.
         cpu.atc.flush_all();
         cpu.trace_t0_68040_sync();
         return 4;

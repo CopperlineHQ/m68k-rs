@@ -296,6 +296,12 @@ pub struct CpuCore {
     /// is not serialized (restored empty) and is flushed on any mapping change.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub atc: crate::mmu::Atc,
+    /// The 68030's own address translation cache (see
+    /// [`crate::mmu::Atc030`]). Unlike `atc` it is serialized: its contents
+    /// decide which later accesses pay for a table search, so a state
+    /// restored with it empty would run differently from the original.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub atc_030: crate::mmu::Atc030,
     /// Cause of the MMU fault currently being delivered (set by
     /// handle_mmu_fault, consumed while composing the 68060 FSLW); plain
     /// physical bus errors leave it None. Transient within one exception.
@@ -608,6 +614,7 @@ impl CpuCore {
             pcr: PCR_060_RESET,
             buscr: 0,
             atc: crate::mmu::Atc::default(),
+            atc_030: crate::mmu::Atc030::default(),
             pending_fault_cause: None,
             mmu_fc_override: None,
             mmu_read_override: None,
@@ -792,6 +799,7 @@ impl CpuCore {
         self.mmu_tt0 = 0;
         self.mmu_tt1 = 0;
         self.atc.flush_all();
+        self.atc_030.flush_all();
         self.prefetch_queue = [0; 2];
         self.prefetch_count = 0;
         self.consume_without_prefetch = false;
@@ -2185,19 +2193,21 @@ impl CpuCore {
             }
             return 8;
         }
-        // PLOAD / PFLUSH / PFLUSHA (68030 forms): recognized but not yet
-        // fully modelled. Treat them as NOPs rather than returning 0, which
+        // PLOAD / PFLUSH / PFLUSHA (68030 forms), and the 68851 flush forms
+        // software also issues. On the 68030 they load or invalidate its
+        // ATC; on the 68040 they stay NOPs rather than returning 0, which
         // the decoder would turn into a LINE-1111 trap -- AROS and the
         // 68040.library issue these during MMU setup, so trapping crashes
-        // the boot. There is no ATC on the 030 walk, so a flush has nothing
-        // to drop.
+        // the boot.
         if (modes & 0xFDE0) == 0x2000   // PLOAD
-            || (modes & 0xE200) == 0x2000
-            || modes == 0xA000          // PFLUSHA
+            || (modes & 0xE200) == 0x2000 // PFLUSH, PFLUSHA
+            || modes == 0xA000
             || modes == 0x2800
             || (modes & 0xFFF8) == 0x2C00
-        // PFLUSH
         {
+            if !is_040 {
+                self.pload_pflush_030(bus, opcode, modes);
+            }
             return 8;
         }
 
@@ -2269,7 +2279,7 @@ impl CpuCore {
                 _ => 0,
             }
         } else {
-            match preg {
+            let cycles = match preg {
                 0x10 => {
                     // TC (32)
                     let v = self.read_resolved_ea(bus, ea, Size::Long);
@@ -2315,7 +2325,67 @@ impl CpuCore {
                     4
                 }
                 _ => 0,
+            };
+            // A PMOVE to TC, SRP or CRP flushes the ATC unless FD (bit 8,
+            // the PMOVEFD form) asks it not to. The flush follows the
+            // operand fetch: those reads translate through the mapping in
+            // force before the write, using and refilling the ATC, and
+            // anything they leave behind must not outlive the new root.
+            // The TT registers are checked ahead of the ATC, so writing
+            // them needs no flush.
+            if cycles != 0 && matches!(preg, 0x10 | 0x12 | 0x13) && modes & 0x0100 == 0 {
+                self.atc_030.flush_all();
             }
+            cycles
+        }
+    }
+
+    /// The 68030 PLOAD and PFLUSH forms (extension word `001 MODE 0 MASK
+    /// FC`): MODE 000 is PLOAD (bit 9 R/W) and searches the tables for the
+    /// EA to load its ATC entry; 001 is PFLUSHA; 100 flushes the entries
+    /// whose function code matches FC under MASK, and 110 also requires the
+    /// EA's page. The other (68851) forms software issues flush everything:
+    /// over-flushing only costs table searches.
+    fn pload_pflush_030<B: AddressBus>(&mut self, bus: &mut B, opcode: u16, modes: u16) {
+        use super::ea::{AddressingMode, EaResult};
+        use super::types::Size;
+
+        let mode = (modes >> 10) & 7;
+        let fcf = u32::from(modes & 0x1F);
+        let fc = if fcf & 0x10 != 0 {
+            fcf & 7 // immediate
+        } else if fcf & 0x08 != 0 {
+            self.d((fcf & 7) as usize) & 7 // Dn
+        } else if fcf == 1 {
+            self.dfc & 7
+        } else {
+            self.sfc & 7
+        } as u8;
+        let mask = ((modes >> 5) & 7) as u8;
+        let ea = |cpu: &mut Self, bus: &mut B| {
+            let am = AddressingMode::decode(((opcode >> 3) & 7) as u8, (opcode & 7) as u8)?;
+            match cpu.resolve_ea(bus, am, Size::Long) {
+                EaResult::Memory(addr) => Some(addr),
+                _ => None,
+            }
+        };
+        if modes >> 13 != 1 {
+            self.atc_030.flush_all();
+            return;
+        }
+        match mode {
+            0 => {
+                if let Some(addr) = ea(self, bus) {
+                    crate::mmu::pload_030(self, bus, addr, fc, modes & 0x0200 == 0);
+                }
+            }
+            1 => self.atc_030.flush_all(),
+            4 => self.atc_030.flush_fc(fc, mask),
+            6 => match ea(self, bus) {
+                Some(addr) => self.atc_030.flush_fc_page(fc, mask, addr),
+                None => self.atc_030.flush_all(),
+            },
+            _ => self.atc_030.flush_all(),
         }
     }
 

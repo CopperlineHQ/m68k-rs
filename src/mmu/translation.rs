@@ -233,8 +233,8 @@ fn walk_030<B: AddressBus>(
     };
 
     // Walk state: current table pointer + descriptor format and the logical
-    // bits consumed so far. This is the per-access hot path (the 030 walk
-    // has no ATC), so no allocation.
+    // bits consumed so far. Every ATC miss and PTEST comes through here, so
+    // no allocation.
     let mut long = match root_limit & 3 {
         2 => false,
         3 => true,
@@ -343,8 +343,27 @@ fn low_bits(addr: u32, shift: u32) -> u32 {
     }
 }
 
+/// The 68030 ATC's page shift for this TC: the logical bits a full-depth
+/// walk leaves untranslated (IS plus every configured TIx level, as
+/// [`walk_030`] consumes them). That is the smallest region any page
+/// descriptor maps, so one entry per such page is exact for every
+/// descriptor, early termination included. `None` for a TC whose levels
+/// consume the whole address (no page left to cache) or none of it (no
+/// address bits to tag a page with), so the shift is always 1..=31.
+fn page_shift_030(tc: u32) -> Option<u32> {
+    let is = (tc >> 16) & 0xF;
+    let levels: u32 = [(tc >> 12) & 0xF, (tc >> 8) & 0xF, (tc >> 4) & 0xF, tc & 0xF]
+        .into_iter()
+        .take_while(|&bits| bits != 0)
+        .sum();
+    let consumed = is + levels;
+    (1..32).contains(&consumed).then(|| 32 - consumed)
+}
+
 /// 68030 address translation on top of [`walk_030`], enforcing the
-/// accumulated write-protect and supervisor-only bits for the access.
+/// accumulated write-protect and supervisor-only bits for the access. The
+/// ATC ([`crate::mmu::Atc030`]) answers repeat accesses to a page without a
+/// table search, as the silicon's does.
 fn translate_030<B: AddressBus>(
     cpu: &mut CpuCore,
     bus: &mut B,
@@ -360,6 +379,12 @@ fn translate_030<B: AddressBus>(
     } else {
         1
     };
+    let shift = page_shift_030(cpu.mmu_tc);
+    if let Some(shift) = shift
+        && let Some(page_base) = cpu.atc_030.lookup(fc as u8, logical >> shift, shift, write)
+    {
+        return Ok(page_base.wrapping_add(low_bits(logical, 32 - shift)));
+    }
     let w = walk_030(cpu, bus, logical, fc, u32::MAX);
     match w.end {
         Walk030End::Page { field, consumed } => {
@@ -369,11 +394,21 @@ fn translate_030<B: AddressBus>(
                     MmuFaultCause::SupervisorProtect,
                 ));
             }
+            let base = field & 0xFFFF_FF00;
+            let phys = low_bits(logical, consumed).wrapping_add(base);
+            if let Some(shift) = shift {
+                // The search loads the entry even for a write that then
+                // faults on write protection. The entry keeps the page's
+                // translation exactly as the walk forms it, so a hit adds
+                // the in-page offset back the same way.
+                let page_base = phys.wrapping_sub(low_bits(logical, 32 - shift));
+                cpu.atc_030
+                    .insert(fc as u8, logical >> shift, shift, page_base, w.wp);
+            }
             if write && w.wp {
                 return Err(access_fault_cause(logical, MmuFaultCause::WriteProtect));
             }
-            let base = field & 0xFFFF_FF00;
-            Ok(low_bits(logical, consumed).wrapping_add(base))
+            Ok(phys)
         }
         Walk030End::Invalid { indirect: false } => Err(access_fault(logical)),
         Walk030End::Invalid { indirect: true } => {
@@ -383,6 +418,46 @@ fn translate_030<B: AddressBus>(
         Walk030End::Config => Err(config_fault(logical)),
         // A full walk never stops on the level limit.
         Walk030End::LevelStop => Err(config_fault(logical)),
+    }
+}
+
+/// 68030 PLOAD: search the tables for `logical` in the `fc` address space
+/// and load the resulting translation into the ATC, as a translated access
+/// would but without making one. The page's previous entry goes first, so
+/// a search that finds no usable translation -- a transparently translated
+/// address, an invalid descriptor, a supervisor-only page probed from a
+/// user space -- leaves the next access to search and fault rather than
+/// hit a stale mapping (the silicon loads an entry marking the translation
+/// invalid; this cache keeps no such entries). Not modelled: the
+/// used/modified write-back the R/W form selects.
+pub(crate) fn pload_030<B: AddressBus>(
+    cpu: &mut CpuCore,
+    bus: &mut B,
+    logical: u32,
+    fc: u8,
+    write: bool,
+) {
+    if !cpu.pmmu_enabled || !cpu.has_pmmu {
+        return;
+    }
+    cpu.atc_030.flush_fc_page(fc, 7, logical);
+    let Some(shift) = page_shift_030(cpu.mmu_tc) else {
+        return;
+    };
+    if super::ttr::ttr_matches(cpu.mmu_tt0, logical, fc, write)
+        || super::ttr::ttr_matches(cpu.mmu_tt1, logical, fc, write)
+    {
+        return;
+    }
+    let w = walk_030(cpu, bus, logical, u32::from(fc), u32::MAX);
+    if let Walk030End::Page { field, consumed } = w.end {
+        if w.sup && fc & 4 == 0 {
+            return;
+        }
+        let phys = low_bits(logical, consumed).wrapping_add(field & 0xFFFF_FF00);
+        let page_base = phys.wrapping_sub(low_bits(logical, 32 - shift));
+        cpu.atc_030
+            .insert(fc, logical >> shift, shift, page_base, w.wp);
     }
 }
 
