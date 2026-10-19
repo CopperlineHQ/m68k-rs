@@ -826,6 +826,21 @@ impl TraceBuildOp {
     fn length(self) -> u8 {
         2 + 2 * u8::from(self.extension.is_some()) + 2 * u8::from(self.extension2.is_some())
     }
+
+    /// Where a link-exit region ending on this op leaves the guest: the
+    /// pc the op hands control to on its recorded path. Terminals
+    /// materialize the pc themselves; a plain op continues at its
+    /// sequential successor, but the two non-terminal call ops do not --
+    /// a callee's RTS lands at its recorded return address, and a
+    /// recorded call lands at a callee the op does not name, so a region
+    /// can never end on one.
+    fn link_exit_pc(self) -> Option<u32> {
+        match self.op {
+            JitTraceOp::RtsReturn { expected_return } => Some(expected_return),
+            JitTraceOp::CallThrough { .. } => None,
+            _ => Some(self.pc.wrapping_add(u32::from(self.length()))),
+        }
+    }
 }
 
 /// One contiguous guest-code range inside the execution-ordered `code`
@@ -3475,8 +3490,21 @@ impl TraceJit {
             // guard-exit side paths of a hot loop compile: their natural
             // shape rejoins the loop at its head rather than closing a
             // backward branch of their own.
-            let links_to_compiled_head = recorded_exit_pc
-                .is_some_and(|exit| exit != start_pc && self.compiled_head_at(exit, cpu_type));
+            //
+            // The executors land a link exit at the tail's continuation
+            // (`link_exit_pc`), which is not always the next sequential
+            // instruction: a callee's checked RTS continues at its return
+            // address. The recorded exit must be that continuation for the
+            // head check to say anything about where the trace goes. A
+            // tail with no static continuation (a host boundary right
+            // after a recorded BSR stops at a callee the call op does not
+            // name) or a recording stopped anywhere else (inside an
+            // if-converted block, short of its join) does not link.
+            let links_to_compiled_head = recorded_exit_pc.is_some_and(|exit| {
+                exit != start_pc
+                    && ops.last().and_then(|op| op.link_exit_pc()) == Some(exit)
+                    && self.compiled_head_at(exit, cpu_type)
+            });
             if !links_to_compiled_head {
                 return Err(RegionRejectReason::NoTraceTerminal);
             }
@@ -4182,13 +4210,15 @@ impl TraceJit {
                 );
                 if !last.op.ends_trace() {
                     // Link-exit tail: no branch materialized the pc; the
-                    // trace exits at the next sequential instruction (the
-                    // linked head).
+                    // trace exits at the tail's continuation (the linked
+                    // head).
                     store_u32(
                         &mut builder,
                         cpu_ptr,
                         offset_of!(CpuCore, pc),
-                        last.pc.wrapping_add(u32::from(last.length())),
+                        last.link_exit_pc().expect(
+                            "compilation admits only link exits with a static continuation",
+                        ),
                     );
                 }
             }
@@ -6837,9 +6867,11 @@ fn execute_portable_trace_raw(cpu: &mut CpuCore, ops: &[TraceBuildOp], spans: Co
         cpu.ir = last.opcode as u32;
         if !last.op.ends_trace() {
             // Link-exit tail: a plain op does not materialize the pc the
-            // way branch terminals do; the trace exits at the next
-            // sequential instruction (the linked head).
-            cpu.pc = last.pc.wrapping_add(u32::from(last.length()));
+            // way branch terminals do; the trace exits at the tail's
+            // continuation (the linked head).
+            cpu.pc = last
+                .link_exit_pc()
+                .expect("compilation admits only link exits with a static continuation");
         }
     }
     ((retired as u64) << 32) | cycles as u32 as u64 | TRACE_RETURN_COMPLETE
@@ -18166,6 +18198,302 @@ mod portable_tests {
             Some((A, A + 10, LEAF, LEAF + 4)),
             "two tight code intervals, not one spanning the gap"
         );
+    }
+
+    /// `SUBQ.W #1,D7 ; BNE.S *-2` compiled at `pc`: a head a link-exit
+    /// region can end on.
+    fn countdown_head(jit: &mut TraceJit, cpu: &CpuCore, pc: u32) -> CompiledTrace {
+        let ops = vec![
+            TraceBuildOp {
+                opcode: 0x5347,
+                extension: None,
+                extension2: None,
+                pc,
+                op: JitTraceOp::AddqSubqReg {
+                    reg: 7,
+                    data: 1,
+                    size: Size::Word,
+                    is_sub: true,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x66FC,
+                extension: None,
+                extension2: None,
+                pc: pc + 2,
+                op: JitTraceOp::Branch {
+                    condition: 6,
+                    displacement: -4,
+                    length: 2,
+                    expected_taken: None,
+                },
+            },
+        ];
+        jit.compile_decoded_ops(cpu, pc, CpuType::M68040, ops, Some(pc))
+            .expect("countdown head compiles")
+    }
+
+    /// `BSR.S leaf ; leaf: ADDQ.L #1,D2 ; RTS` recorded through the call
+    /// and stopped right after the return: a link-exit region whose tail
+    /// is the callee's checked RTS.
+    fn call_leaf_return_ops(head: u32, leaf: u32) -> Vec<TraceBuildOp> {
+        vec![
+            TraceBuildOp {
+                opcode: 0x6100 | (leaf - head - 2) as u16,
+                extension: None,
+                extension2: None,
+                pc: head,
+                op: JitTraceOp::CallThrough {
+                    return_pc: head + 2,
+                    cycles: 18,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x5282,
+                extension: None,
+                extension2: None,
+                pc: leaf,
+                op: JitTraceOp::AddqSubqReg {
+                    reg: 2,
+                    data: 1,
+                    size: Size::Long,
+                    is_sub: false,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x4E75,
+                extension: None,
+                extension2: None,
+                pc: leaf + 2,
+                op: JitTraceOp::RtsReturn {
+                    expected_return: head + 2,
+                },
+            },
+        ]
+    }
+
+    /// A link-exit region ending on a callee's RTS continues at the
+    /// recorded return address -- the RTS's continuation -- not at the
+    /// word after the RTS, which is the callee's next instruction. Both
+    /// executors must agree; resuming after the RTS runs callee code with
+    /// the caller's frame and returns through it.
+    #[test]
+    fn link_exit_after_a_callee_return_resumes_at_the_return_address() {
+        const HEAD: u32 = 0x0100;
+        const RET: u32 = HEAD + 2;
+        const LEAF: u32 = 0x0110;
+        let mut probe = cpu();
+        probe.set_cpu_type(CpuType::M68040);
+        let mut jit = TraceJit::new();
+        let head = countdown_head(&mut jit, &probe, RET);
+        jit.slots[trace_cache_index(RET)] = TraceSlot::Compiled(head);
+        let ops = call_leaf_return_ops(HEAD, LEAF);
+        let compiled = jit
+            .compile_decoded_ops(&probe, HEAD, CpuType::M68040, ops.clone(), Some(RET))
+            .expect("a call/return tail links into the head at its return address");
+
+        let spans = CodeSpans {
+            code_start: HEAD,
+            code_end: HEAD + 2,
+            callee_start: LEAF,
+            callee_end: LEAF + 4,
+        };
+        let mut mem = vec![0u8; 0x1000];
+        let mut portable = cpu();
+        portable.set_cpu_type(CpuType::M68040);
+        portable.set_a(7, 0x0800);
+        attach_window(&mut portable, &mut mem);
+        let packed = execute_portable_trace(&mut portable, &compiled.ops, spans);
+        assert_eq!(packed >> 32, 3, "call, leaf and return all retired");
+        assert_eq!(portable.d(2), 1, "the leaf ran once");
+        assert_eq!(portable.a(7), 0x0800, "push and pop balanced");
+        assert_eq!(
+            portable.pc, RET,
+            "portable exit lands at the return address"
+        );
+
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+        {
+            let mut mem = vec![0u8; 0x1000];
+            let mut native = cpu();
+            native.set_cpu_type(CpuType::M68040);
+            native.set_a(7, 0x0800);
+            attach_window(&mut native, &mut mem);
+            let packed = unsafe { compiled.call_native(&mut native, 1) };
+            assert_eq!(packed >> 32, 3, "call, leaf and return all retired");
+            assert_eq!(native.d(2), 1, "the leaf ran once");
+            assert_eq!(native.a(7), 0x0800, "push and pop balanced");
+            assert_eq!(native.pc, RET, "native exit lands at the return address");
+        }
+    }
+
+    /// A tail whose continuation is not the recorded exit cannot link,
+    /// however the exit came to be a compiled head: a recorded call
+    /// continues at a callee the op does not name, and a plain op at its
+    /// sequential successor only.
+    #[test]
+    fn link_exit_requires_the_tail_to_continue_at_the_recorded_exit() {
+        const HEAD: u32 = 0x0100;
+        const LEAF: u32 = 0x0110;
+        let mut probe = cpu();
+        probe.set_cpu_type(CpuType::M68040);
+        let mut jit = TraceJit::new();
+        let leaf_head = countdown_head(&mut jit, &probe, LEAF);
+        jit.slots[trace_cache_index(LEAF)] = TraceSlot::Compiled(leaf_head);
+
+        // ADDQ ; ADDQ ; BSR.S leaf -- stopped at the callee's head.
+        let mut ops = vec![
+            TraceBuildOp {
+                opcode: 0x5283,
+                extension: None,
+                extension2: None,
+                pc: HEAD,
+                op: JitTraceOp::AddqSubqReg {
+                    reg: 3,
+                    data: 1,
+                    size: Size::Long,
+                    is_sub: false,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x5284,
+                extension: None,
+                extension2: None,
+                pc: HEAD + 2,
+                op: JitTraceOp::AddqSubqReg {
+                    reg: 4,
+                    data: 1,
+                    size: Size::Long,
+                    is_sub: false,
+                },
+            },
+        ];
+        ops.push(call_leaf_return_ops(HEAD + 4, LEAF)[0]);
+        assert!(
+            matches!(
+                jit.compile_decoded_ops_reason(
+                    &probe,
+                    HEAD,
+                    CpuType::M68040,
+                    ops.clone(),
+                    Some(LEAF)
+                ),
+                Err(RegionRejectReason::NoTraceTerminal)
+            ),
+            "a region ending on a recorded call never links"
+        );
+
+        // The two ADDQs alone continue at HEAD + 4, not at LEAF.
+        ops.truncate(2);
+        assert!(
+            matches!(
+                jit.compile_decoded_ops_reason(
+                    &probe,
+                    HEAD,
+                    CpuType::M68040,
+                    ops.clone(),
+                    Some(LEAF)
+                ),
+                Err(RegionRejectReason::NoTraceTerminal)
+            ),
+            "a plain tail links only to its sequential successor"
+        );
+    }
+
+    /// End to end through `run_batch`: a host batch boundary that closes
+    /// a call-through recording right after the callee's RTS, with a
+    /// compiled head already at the return address, compiles the
+    /// call/return path as a link exit. Running it must come back to the
+    /// caller -- Kickstart's LoadSeg relocation loop resumed one word
+    /// past its reader's RTS instead, popped its caller's frame and
+    /// crashed into low memory.
+    #[test]
+    fn host_boundary_after_a_callee_return_links_at_the_return_address() {
+        const HEAD: u32 = 0x2000;
+        const RET: u32 = HEAD + 2;
+        const DONE: u32 = HEAD + 6;
+        const LEAF: u32 = 0x2010;
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (i, w) in [
+            0x6100 | (LEAF - HEAD - 2) as u16, // HEAD: BSR.S LEAF
+            0x5347,                            // RET:  SUBQ.W #1,D7
+            0x66FC,                            //       BNE.S RET
+            0x4E71,                            // DONE: NOP
+        ]
+        .iter()
+        .enumerate()
+        {
+            bus.write_word_at(HEAD + 2 * i as u32, *w);
+        }
+        for (i, w) in [
+            0x5282u16, // LEAF: ADDQ.L #1,D2
+            0x4E75,    //       RTS
+            0x7AFF,    //       MOVEQ #-1,D5 (only a wrong exit gets here)
+            0x60FE,    //       BRA.S *
+        ]
+        .iter()
+        .enumerate()
+        {
+            bus.write_word_at(LEAF + 2 * i as u32, *w);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.set_a(7, 0x8000);
+
+        // The return address is already a compiled loop head.
+        for _ in 0..20 {
+            cpu.set_d(7, 40);
+            cpu.pc = RET;
+            cpu.run_batch(&mut bus, 80, &[]);
+            assert_eq!(cpu.pc, DONE, "the countdown runs to completion");
+        }
+        assert!(
+            with_trace_jit(|jit| jit.compiled_head_at(RET, CpuType::M68040)),
+            "the return address must hold a compiled head first"
+        );
+
+        // A call-through recording at HEAD whose batch ends right after
+        // the callee's RTS.
+        with_trace_jit(|jit| {
+            jit.recording = Some(TraceRecording {
+                start_pc: HEAD,
+                cpu_type: CpuType::M68040,
+                ops: Vec::with_capacity(TRACE_MAX_OPS),
+                adaptive_rerecords: 0,
+                allow_call_through: true,
+                pending_return: None,
+                skip_record_until: None,
+                from_exit_seed: false,
+            });
+        });
+        cpu.trace_recording = true;
+        cpu.set_d(7, 1);
+        cpu.pc = HEAD;
+        let result = cpu.run_batch(&mut bus, 3, &[]);
+        assert_eq!(result.instructions, 3);
+        assert_eq!(cpu.pc, RET, "the recording stopped at the return address");
+        let linked = with_trace_jit(|jit| match &jit.slots[trace_cache_index(HEAD)] {
+            TraceSlot::Compiled(trace) if trace.pc == HEAD => trace
+                .ops
+                .last()
+                .is_some_and(|op| matches!(op.op, JitTraceOp::RtsReturn { .. })),
+            _ => false,
+        });
+        assert!(linked, "the call/return path compiled as a link exit");
+
+        // Run the compiled call/return: it must land at RET and finish
+        // the caller's countdown.
+        cpu.set_d(2, 0);
+        cpu.set_d(5, 0);
+        cpu.set_d(7, 1);
+        cpu.pc = HEAD;
+        let result = cpu.run_batch(&mut bus, 5, &[]);
+        assert_eq!(result.instructions, 5);
+        assert_eq!(cpu.d(5), 0, "no callee code ran after its RTS");
+        assert_eq!(cpu.d(2), 1, "the leaf ran once");
+        assert_eq!(cpu.a(7), 0x8000, "push and pop balanced");
+        assert_eq!(cpu.pc, DONE, "the caller's countdown finished");
     }
 
     /// `BSR.W far-leaf ; leaf RTS ; MOVE.W D3,(A0) ; BRA.S head` as a
