@@ -685,6 +685,17 @@ impl CpuCore {
         self.fm_ptr < cpu_end && cpu < window_end
     }
 
+    /// Close out a fault taken inside `run_batch` (`execute` and `step` do
+    /// the same): the faulting instruction's own register writes after the
+    /// exception entry -- a JSR or RTS assigning PC, a MOVE setting the
+    /// condition codes -- give way to the handler entry state. Returns true
+    /// when the fault was a double fault that halted the CPU.
+    #[inline]
+    fn end_batch_fault(&mut self) -> bool {
+        self.end_faulted_instruction();
+        self.stopped != 0
+    }
+
     fn run_batch_inner<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -755,7 +766,12 @@ impl CpuCore {
                         };
                     }
                     BatchInnerExit::Fault => {
-                        self.run_mode = RUN_MODE_NORMAL;
+                        if self.end_batch_fault() {
+                            return BatchResult {
+                                instructions: retired,
+                                exit: BatchExit::Stopped,
+                            };
+                        }
                         probe_on_entry = true;
                         continue;
                     }
@@ -768,7 +784,12 @@ impl CpuCore {
                 self.ppc = self.pc;
                 let opcode = self.read_opcode_16(bus);
                 if self.run_mode == RUN_MODE_BERR_AERR_RESET {
-                    self.run_mode = RUN_MODE_NORMAL;
+                    if self.end_batch_fault() {
+                        return BatchResult {
+                            instructions: retired,
+                            exit: BatchExit::Stopped,
+                        };
+                    }
                     probe_on_entry = true;
                     continue;
                 }
@@ -860,7 +881,10 @@ impl CpuCore {
                 // instruction being recorded. Discard the partial path before
                 // execution resumes at the exception vector.
                 trace_jit::stop_recording(self, trace_jit::RecordingStop::TrapOrException);
-                self.run_mode = RUN_MODE_NORMAL;
+                // Re-assert the handler entry the fault established, as
+                // `execute` and `step` do; a double fault stays halted and
+                // returns at the stopped check below.
+                self.end_faulted_instruction();
                 probe_on_entry = true;
             } else {
                 // A complex opcode leaves the decoded fast path and executes
