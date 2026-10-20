@@ -604,7 +604,9 @@ impl CpuCore {
     /// instruction-budgeted and does not maintain cycle accounting
     /// (`cycles_remaining` is clobbered). Trace exceptions are taken
     /// internally and pending interrupts are serviced between instructions,
-    /// matching [`step`](Self::step) semantics.
+    /// matching [`step`](Self::step) semantics. A host that models the
+    /// caches learns of a CACR write or cache invalidation inside the batch
+    /// through [`AddressBus::cache_control`], before the next fetch.
     pub fn run_batch<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -697,6 +699,16 @@ impl CpuCore {
     fn end_batch_fault(&mut self) -> bool {
         self.end_faulted_instruction();
         self.stopped != 0
+    }
+
+    /// Hand a cache-control change made inside `run_batch` to the bus
+    /// before the next fetch (see [`AddressBus::cache_control`]).
+    #[cold]
+    #[inline(never)]
+    fn report_cache_control<B: AddressBus>(&mut self, bus: &mut B) {
+        if bus.cache_control(self.cacr, self.caar, self.cacr_pending_ops) {
+            self.cacr_pending_ops = 0;
+        }
     }
 
     fn run_batch_inner<B: AddressBus>(
@@ -815,7 +827,13 @@ impl CpuCore {
                 self.prepare_rollback_snapshot(opcode);
             }
 
+            // MOVEC to CACR, CINV and CPUSH never run on the decoded paths,
+            // so a cache-control change can only come from full dispatch.
+            let cache_control = (self.cacr, self.cacr_pending_ops);
             let result = dispatch_instruction(self, bus, opcode);
+            if (self.cacr, self.cacr_pending_ops) != cache_control {
+                self.report_cache_control(bus);
+            }
 
             // A dispatched instruction may have written TC or a TT register
             // (PMOVE/MOVEC): the window translates with the new state from

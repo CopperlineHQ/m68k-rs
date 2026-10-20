@@ -363,6 +363,32 @@ pub trait AddressBus {
     /// Notify attached devices that the CPU asserted the external RESET line.
     fn reset_devices(&mut self) {}
 
+    /// Act on a cache-control change made inside
+    /// [`CpuCore::run_batch`](crate::CpuCore::run_batch).
+    ///
+    /// The core keeps CACR in `CpuCore::cacr` and latches the write-only
+    /// clear strobes (CI/CEI/CD/CED, and the 68040/060 CINV/CPUSH, which
+    /// surface as CI/CD) in `CpuCore::cacr_pending_ops` for a host that
+    /// models the caches. A host that syncs its model only between calls
+    /// into the core is too late inside a batch: the CPU acts on an
+    /// invalidation before its next fetch, so code rewritten and run right
+    /// after a cache clear would be served stale lines for the rest of the
+    /// batch. `run_batch` therefore calls this as soon as an instruction
+    /// changes the stored CACR or adds a strobe to `cacr_pending_ops` (a
+    /// MOVEC to CACR, a CINV or a CPUSH), before anything else is fetched.
+    /// `cacr` is the stored CACR, `caar` the CAAR, and `strobes` every
+    /// strobe pending in `cacr_pending_ops`.
+    ///
+    /// Return `true` once the strobes have been acted on; the core then
+    /// clears `cacr_pending_ops`. The default returns `false` and leaves
+    /// them pending for the host to drain after the batch. The other entry
+    /// points never call this: they return to the host after every
+    /// instruction or cycle budget, where it can sync directly.
+    #[inline]
+    fn cache_control(&mut self, _cacr: u32, _caar: u32, _strobes: u32) -> bool {
+        false
+    }
+
     /// Expose a direct window into contiguous, side-effect-free guest RAM.
     ///
     /// See [`FastMem`] for the exact contract. Returning `Some` lets
