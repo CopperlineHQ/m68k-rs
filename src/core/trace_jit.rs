@@ -4902,7 +4902,13 @@ impl<B: AddressBus> AddressBus for RecorderCodeBus<'_, B> {
 /// Attempt to execute a compiled trace at the current PC. See
 /// [`TraceJit::try_execute`] for the meaning of the returned count and of
 /// `instr_budget`/`single_iter`.
-pub(crate) fn try_execute_trace<B: AddressBus>(
+///
+/// `TRANSLATED` is the window mode of the calling decoded batch loop
+/// instance and changes nothing here: it gives each instance a copy of its
+/// own, so the physical loop's sole caller inlines it as it did before
+/// translation existed. Called from both, it stayed out of line, which
+/// cost the physical loop measurably.
+pub(crate) fn try_execute_trace<B: AddressBus, const TRANSLATED: bool>(
     cpu: &mut CpuCore,
     bus: &mut B,
     cpu_type: CpuType,
@@ -22909,7 +22915,7 @@ mod portable_tests {
         cpu.pc = A;
         let before = (cpu.d(2), cpu.d(3), cpu.d(4));
         let (result, retired) =
-            try_execute_trace(&mut cpu, &mut bus, CpuType::M68040, 1_000, false, &[])
+            try_execute_trace::<_, false>(&mut cpu, &mut bus, CpuType::M68040, 1_000, false, &[])
                 .expect("compiled segment executes");
         assert!(matches!(result, CachedRunResult::Ran));
         assert_eq!(retired, 3, "three real ops, the A-line not counted");
@@ -22923,7 +22929,8 @@ mod portable_tests {
         // region: the segment must refuse to run stale semantics.
         bus.write_word_at(TRAP1, 0xA125);
         cpu.pc = A;
-        let after_smc = try_execute_trace(&mut cpu, &mut bus, CpuType::M68040, 1_000, false, &[]);
+        let after_smc =
+            try_execute_trace::<_, false>(&mut cpu, &mut bus, CpuType::M68040, 1_000, false, &[]);
         match after_smc {
             None => {}
             Some((CachedRunResult::Miss(opcode), 0)) => assert_eq!(opcode, 0x5282),

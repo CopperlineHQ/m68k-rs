@@ -1599,27 +1599,58 @@ pub(crate) fn peek_window_word(cpu: &CpuCore, addr: u32) -> Option<u16> {
     Some(win.read(off, Size::Word) as u16)
 }
 
+/// Execute `op` through the batch window, or return false (nothing
+/// committed) for full dispatch to take it. `TRANSLATED` is the window
+/// mode, which the caller knows statically: each instance of the decoded
+/// batch loop calls its executor directly. Going through one entry that
+/// branched on the mode cost the physical loop two taken branches and a
+/// tail call per memory op, enough to leave it measurably front-end bound
+/// in a whole-program (fat LTO) build.
+#[inline(always)]
+pub(crate) fn execute_window_mem_op<const TRANSLATED: bool>(
+    cpu: &mut CpuCore,
+    op: DecodedMemOp,
+) -> bool {
+    if TRANSLATED {
+        execute_translated_mem_op(cpu, op)
+    } else {
+        execute_physical_mem_op(cpu, op)
+    }
+}
+
+/// [`execute_window_mem_op`] for callers that learn only at run time
+/// whether the window translates.
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
-    // These decoded handlers perform raw stores. Until they support tracked
-    // writes, preserve ordinary dispatch and its metadata hooks between traces.
-    if cpu.fm_write_hook != 0 {
-        return false;
-    }
     if cpu.fm_mmu.enabled() {
-        return execute_translated_mem_op(cpu, op);
+        execute_translated_mem_op(cpu, op)
+    } else {
+        execute_physical_mem_op(cpu, op)
     }
+}
+
+/// The executor with the PMMU disabled. It compiles as the executor did
+/// before translation existed.
+fn execute_physical_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
     execute_mem_op_in::<false>(cpu, op)
 }
 
-/// [`execute_mem_op`] through a translated window, kept out of line so the
-/// physical executor inlines as it did before translation existed.
+/// The executor through a translated window, kept out of line like the
+/// physical one.
 #[inline(never)]
 fn execute_translated_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
     execute_mem_op_in::<true>(cpu, op)
 }
 
-#[inline]
+/// The executor body, inlined into both executors so that neither is a
+/// wrapper around a shared copy.
+#[inline(always)]
 fn execute_mem_op_in<const T: bool>(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
+    // These decoded handlers perform raw stores. Until they support tracked
+    // writes, preserve ordinary dispatch and its metadata hooks between traces.
+    if cpu.fm_write_hook != 0 {
+        return false;
+    }
     let Some(win) = Win::<T>::from_cpu(cpu) else {
         return false;
     };

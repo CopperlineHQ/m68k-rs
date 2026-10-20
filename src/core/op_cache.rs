@@ -1044,6 +1044,14 @@ impl CpuCore {
         )
     }
 
+    /// The decoded loop through a translated window. Cold only as a branch
+    /// weight for the caller: with no profile LLVM split the batch path
+    /// evenly between the two loops, which halved every block frequency in
+    /// the physical one, pushed its rarer operation arms under the cold
+    /// call-site inlining threshold and laid it out worse. Block frequencies
+    /// inside this loop are relative to its own entry, so it compiles the
+    /// same either way.
+    #[cold]
     #[inline(never)]
     fn run_translated_simple_batch<B: AddressBus>(
         &mut self,
@@ -1089,7 +1097,7 @@ impl CpuCore {
                 // having an unrelated watch (for example, a clean-exit
                 // sentinel at PC 0) must not serialize every JIT iteration.
                 let single_iter = watch && watch_pcs.contains(&self.pc);
-                if let Some((result, instructions)) = trace_jit::try_execute_trace(
+                if let Some((result, instructions)) = trace_jit::try_execute_trace::<B, TRANSLATED>(
                     self,
                     bus,
                     cpu_type,
@@ -1179,7 +1187,7 @@ impl CpuCore {
                     }
                 }
                 CachedOp::Mem(op) => {
-                    if !super::mem_ops::execute_mem_op(self, op) {
+                    if !super::mem_ops::execute_window_mem_op::<TRANSLATED>(self, op) {
                         // Tracked windows intentionally use full dispatch for
                         // this instruction, whose successful completion is
                         // recorded by run_batch_inner. This is not a host yield.

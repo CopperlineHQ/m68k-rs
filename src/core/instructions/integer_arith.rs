@@ -132,7 +132,8 @@ impl CpuCore {
         4
     }
 
-    /// Execute ADDX instruction.
+    /// Execute ADDX instruction. Always inlined, like `set_add_flags`.
+    #[inline(always)]
     pub fn exec_addx(&mut self, size: Size, src: u32, dst: u32) -> u32 {
         let mask = size.mask();
         let msb = size.msb_mask();
@@ -235,7 +236,8 @@ impl CpuCore {
         4
     }
 
-    /// Execute SUBX instruction.
+    /// Execute SUBX instruction. Always inlined, like `set_add_flags`.
+    #[inline(always)]
     pub fn exec_subx(&mut self, size: Size, src: u32, dst: u32) -> u32 {
         let mask = size.mask();
         let msb = size.msb_mask();
@@ -537,6 +539,11 @@ impl CpuCore {
     /// may pass full register values: with unmasked operands the byte/word
     /// carry (a raw bit above the operation width) and the V comparison
     /// would see the register's upper bits.
+    ///
+    /// Always inlined, like the other flag helpers: the decoded-op fast
+    /// path calls them from operation arms that LLVM's static profile can
+    /// rate cold, and an out-of-line call there costs more than the update.
+    #[inline(always)]
     pub fn set_add_flags(&mut self, src: u32, dst: u32, result: u32, size: Size) {
         let msb = size.msb_mask();
         let mask = size.mask();
@@ -600,6 +607,8 @@ impl CpuCore {
 
     /// Set flags for SUB/CMP operation.
     /// Musashi: CFLAG_SUB_32(S, D, R) = ((S & R) | (~D & (S | R))) >> 23
+    /// Always inlined, like `set_add_flags`.
+    #[inline(always)]
     pub fn set_sub_flags(&mut self, src: u32, dst: u32, result: u32, size: Size) {
         let msb = size.msb_mask();
         let mask = size.mask();
@@ -633,7 +642,8 @@ impl CpuCore {
         self.x_flag = self.c_flag;
     }
 
-    /// Set flags for CMP (no X flag).
+    /// Set flags for CMP (no X flag). Always inlined, like `set_add_flags`.
+    #[inline(always)]
     pub(crate) fn set_cmp_flags(&mut self, src: u32, dst: u32, result: u32, size: Size) {
         let msb = size.msb_mask();
         let mask = size.mask();
