@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.14.7](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.6...m68k-v0.14.7) (2026-10-20)
+
+
+### Bug Fixes
+
+* **cpu:** correct MC68000 division timing and overflow ([7e20ef1](https://github.com/benletchford/m68k-rs/commit/7e20ef1849bd4073543215e76d56f7a36692dc77))
+* **cpu:** enter fault handlers from run_batch with the handler state ([12f3d56](https://github.com/benletchford/m68k-rs/commit/12f3d56a858169ef64f43f6097bc69d7466ec6bb))
+* **fpu:** correct extended exponent and rounding behavior ([3be19f7](https://github.com/benletchford/m68k-rs/commit/3be19f7aef9c4f29142b4338d0bbc49027f3a234))
+* **fpu:** round FMOVE to single, double and integer formats ([8c8a3b4](https://github.com/benletchford/m68k-rs/commit/8c8a3b4397e4fb98e63d803b7d9745bdfb134ca5))
+* **jit:** hand cache-control changes to bus before batch fetch ([0103183](https://github.com/benletchford/m68k-rs/commit/01031839a5a26afe38229196bfc4d8dbd6a17ee2))
+* **jit:** resume a callee-return link exit at its return address ([8b759a3](https://github.com/benletchford/m68k-rs/commit/8b759a3d0390346814e977a1373f897872fe89df))
+* **mmu:** cache 68030 translations in its ATC ([f2960c8](https://github.com/benletchford/m68k-rs/commit/f2960c886c5523e4762b1e695de523842cf575c0))
+
+
+### Performance Improvements
+
+* **jit:** restore physical decoded batch-loop performance ([296196e](https://github.com/benletchford/m68k-rs/commit/296196ee18b576cabea6079cca11ab5285b0a9b6))
+* **jit:** use fastmem window during PMMU translation ([e89523e](https://github.com/benletchford/m68k-rs/commit/e89523ec2835de566d44cab640ef7bb8c9b92b8d))
+
 ## [0.14.6](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.5...m68k-v0.14.6) (2026-10-15)
 
 
