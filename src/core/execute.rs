@@ -614,9 +614,9 @@ impl CpuCore {
         let prior_precision = self.precise_bus;
         self.set_precise_bus(false);
         // Capture the bus's fastmem window for the duration of this batch.
-        // Never with an active MMU: fastmem addresses are physical.
-        if !(self.has_pmmu && self.pmmu_enabled)
-            && let Some(fm) = bus.fast_mem()
+        // Its addresses are physical: with the PMMU enabled every access
+        // through it is translated first (`crate::core::window`).
+        if let Some(fm) = bus.fast_mem()
             && fm.len >= 4
             && !fm.ptr.is_null()
         {
@@ -634,7 +634,6 @@ impl CpuCore {
         // writes. Keep that bus sequencing until tracked codegen models it.
         if self.fm_len == 0
             && !super::op_cache::is_pre_68020(self.cpu_type)
-            && !(self.has_pmmu && self.pmmu_enabled)
             && let Some(window) = bus.tracked_mem()
             && window.len >= 4
             && !window.ptr.is_null()
@@ -665,6 +664,9 @@ impl CpuCore {
             self.fm_write_hook = 0;
             self.fm_store_filter = 0;
         }
+        if self.has_pmmu {
+            self.refresh_window_mmu();
+        }
         let result = self.run_batch_inner(bus, max_instructions, watch_pcs);
         self.fm_ptr = 0;
         self.fm_base = 0;
@@ -672,6 +674,7 @@ impl CpuCore {
         self.fm_bus = 0;
         self.fm_write_hook = 0;
         self.fm_store_filter = 0;
+        self.fm_mmu = crate::mmu::ResidentMmu::default();
         self.set_precise_bus(prior_precision);
         result
     }
@@ -814,13 +817,11 @@ impl CpuCore {
 
             let result = dispatch_instruction(self, bus, opcode);
 
-            // A dispatched instruction may have enabled the MMU
-            // (PMOVE/MOVEC); fastmem addresses are physical, so drop the
-            // window as soon as translation turns on.
-            if self.fm_len != 0 && self.has_pmmu && self.pmmu_enabled {
-                self.fm_ptr = 0;
-                self.fm_base = 0;
-                self.fm_len = 0;
+            // A dispatched instruction may have written TC or a TT register
+            // (PMOVE/MOVEC): the window translates with the new state from
+            // the next access on.
+            if self.fm_len != 0 && self.has_pmmu {
+                self.refresh_window_mmu();
             }
 
             let exit = match result {

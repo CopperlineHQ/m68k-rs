@@ -360,6 +360,140 @@ fn page_shift_030(tc: u32) -> Option<u32> {
     (1..32).contains(&consumed).then(|| 32 - consumed)
 }
 
+const RESIDENT_OFF: u8 = 0;
+const RESIDENT_030: u8 = 1;
+const RESIDENT_040: u8 = 2;
+
+/// The translation-control state [`probe_resident`] consults, gathered
+/// from TC and the TT registers once instead of on every access. The batch
+/// executor captures it when it installs the fastmem window and again after
+/// every instruction it fully dispatches (the only kind that writes TC or a
+/// TT register), so it always describes the live registers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResidentMmu {
+    /// `RESIDENT_OFF` (no enabled PMMU), `RESIDENT_030` or `RESIDENT_040`.
+    kind: u8,
+    /// The 68030 ATC page shift (0 when TC leaves no page to cache), or the
+    /// 68040/68060 page size in bits.
+    shift: u8,
+    /// Whether a transparent-translation register the access path checks
+    /// is enabled.
+    tt: bool,
+    /// Byte mask of the smallest page any translation or interpreter page
+    /// split uses: an access inside one such page translates through a
+    /// single TT match or ATC entry, exactly as the interpreter would.
+    pub(crate) page_mask: u32,
+}
+
+impl ResidentMmu {
+    /// The state for `cpu`'s current PMMU registers.
+    pub(crate) fn of(cpu: &CpuCore) -> Self {
+        if !cpu.has_pmmu || !cpu.pmmu_enabled {
+            return Self::default();
+        }
+        let tt = super::ttr::any_transparent_translation(cpu);
+        if cpu.is_040() || cpu.is_060() {
+            let page_bits = if cpu.mmu_tc & 0x0000_4000 != 0 {
+                13
+            } else {
+                12
+            };
+            return Self {
+                kind: RESIDENT_040,
+                shift: page_bits,
+                tt,
+                page_mask: (1 << page_bits) - 1,
+            };
+        }
+        let shift = page_shift_030(cpu.mmu_tc).unwrap_or(0);
+        // The interpreter splits accesses at TC.PS pages; a malformed TC can
+        // make the ATC's pages smaller still.
+        let atc_mask = if shift == 0 {
+            u32::MAX
+        } else {
+            u32::MAX >> (32 - shift)
+        };
+        Self {
+            kind: RESIDENT_030,
+            shift: shift as u8,
+            tt,
+            page_mask: cpu.mmu_page_mask().min(atc_mask),
+        }
+    }
+
+    /// Whether a PMMU is enabled (the batch window must translate).
+    #[inline(always)]
+    pub(crate) fn enabled(self) -> bool {
+        self.kind != RESIDENT_OFF
+    }
+}
+
+/// Translation without a table search, for the batch fastmem paths: the
+/// physical address the enabled PMMU's transparent-translation registers or
+/// ATC give `logical`, or `None` when only a table search could tell -- an
+/// ATC miss, or a cached translation this access would fault on (a write to
+/// a write-protected page, a user access to a supervisor-only one). It is
+/// [`translate`]'s hit path against the same registers and ATC, so a `Some`
+/// is the address `translate` would return, and a `None` leaves the access
+/// to `translate` to search the tables and raise any fault.
+///
+/// It leaves the 68030 ATC's replacement order as it was, and so does
+/// `translate` itself while the window translates: no hit in a batch
+/// records a use, whether it came through the window, a compiled trace or
+/// the interpreter's bus path, so entries age by when table searches loaded
+/// them. Table searches happen at the same instructions whichever way an
+/// instruction ran, so the order does not depend on which instructions ran
+/// from compiled traces (which reach memory through the window and make no
+/// instruction fetches): a state saved mid-run resumes, with empty JIT
+/// caches, to the same ATC behaviour as the uninterrupted run. Outside
+/// `run_batch`, hits record uses and replacement is least recently used.
+///
+/// `mmu` must be `ResidentMmu::of(cpu)`, and the access an ordinary one (no
+/// MOVES function-code override).
+#[inline]
+pub(crate) fn probe_resident(
+    cpu: &CpuCore,
+    mmu: ResidentMmu,
+    logical: u32,
+    write: bool,
+    instruction: bool,
+) -> Option<u32> {
+    debug_assert_eq!(mmu, ResidentMmu::of(cpu), "stale ResidentMmu");
+    debug_assert!(cpu.mmu_fc_override.is_none());
+    if mmu.tt
+        && let Some(phys) =
+            super::ttr::check_transparent_translation(cpu, logical, write, instruction)
+    {
+        return Some(phys);
+    }
+    let supervisor = cpu.is_supervisor();
+    match mmu.kind {
+        RESIDENT_030 if mmu.shift != 0 => {
+            let shift = u32::from(mmu.shift);
+            let fc = fc_030(supervisor, instruction);
+            let page_base = cpu.atc_030.probe(fc, logical >> shift, shift, write)?;
+            Some(page_base.wrapping_add(low_bits(logical, 32 - shift)))
+        }
+        RESIDENT_040 => {
+            let page_bits = u32::from(mmu.shift);
+            let phys_page = cpu.atc.lookup(logical >> page_bits, supervisor, write)?;
+            Some(phys_page | (logical & ((1 << page_bits) - 1)))
+        }
+        _ => None,
+    }
+}
+
+/// The 68030 function code of an ordinary access.
+#[inline]
+fn fc_030(supervisor: bool, instruction: bool) -> u8 {
+    match (supervisor, instruction) {
+        (false, false) => 1,
+        (false, true) => 2,
+        (true, false) => 5,
+        (true, true) => 6,
+    }
+}
+
 /// 68030 address translation on top of [`walk_030`], enforcing the
 /// accumulated write-protect and supervisor-only bits for the access. The
 /// ATC ([`crate::mmu::Atc030`]) answers repeat accesses to a page without a
@@ -380,10 +514,21 @@ fn translate_030<B: AddressBus>(
         1
     };
     let shift = page_shift_030(cpu.mmu_tc);
-    if let Some(shift) = shift
-        && let Some(page_base) = cpu.atc_030.lookup(fc as u8, logical >> shift, shift, write)
-    {
-        return Ok(page_base.wrapping_add(low_bits(logical, 32 - shift)));
+    if let Some(shift) = shift {
+        let page = logical >> shift;
+        // While `run_batch` translates through its fastmem window, no hit
+        // records a use, this one included: compiled traces reach memory
+        // through the window and fetch no instructions, so uses recorded
+        // here would make the saved replacement order depend on which
+        // instructions ran from traces (see `probe_resident`).
+        let hit = if cpu.fm_mmu.enabled() {
+            cpu.atc_030.probe(fc as u8, page, shift, write)
+        } else {
+            cpu.atc_030.lookup(fc as u8, page, shift, write)
+        };
+        if let Some(page_base) = hit {
+            return Ok(page_base.wrapping_add(low_bits(logical, 32 - shift)));
+        }
     }
     let w = walk_030(cpu, bus, logical, fc, u32::MAX);
     match w.end {

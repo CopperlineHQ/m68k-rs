@@ -22,7 +22,7 @@ use crate::core::memory::AddressBus;
 
 pub use atc::{Atc, Atc030};
 pub use translation::translate;
-pub(crate) use translation::{pload_030, ptest_030};
+pub(crate) use translation::{ResidentMmu, pload_030, probe_resident, ptest_030};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Architectural class of an MMU operation or translation fault.

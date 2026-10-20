@@ -595,19 +595,24 @@ fn decode_alu(opcode: u16) -> Option<DecodedMemOp> {
 // ============================================================================
 
 /// The fastmem window, copied out of the `CpuCore` scratch fields.
+/// `TRANSLATED` while the PMMU is enabled: guest addresses are logical then,
+/// and each access is translated first (`CpuCore::translated_window_off`).
+/// It is a type parameter so the physical instantiation of the executor
+/// compiles exactly as it did before translation existed.
 #[derive(Clone, Copy)]
-struct Win {
+struct Win<const TRANSLATED: bool> {
     ptr: *mut u8,
     base: u32,
     len: u32,
 }
 
-impl Win {
+impl<const TRANSLATED: bool> Win<TRANSLATED> {
     #[inline]
-    fn from_cpu(cpu: &CpuCore) -> Option<Win> {
+    fn from_cpu(cpu: &CpuCore) -> Option<Self> {
         if cpu.fm_len == 0 {
             return None;
         }
+        debug_assert_eq!(TRANSLATED, cpu.fm_mmu.enabled());
         Some(Win {
             ptr: cpu.fm_ptr as *mut u8,
             base: cpu.fm_base,
@@ -615,8 +620,31 @@ impl Win {
         })
     }
 
-    /// Window offset for an access of `bytes` at (masked) `addr`, or None
-    /// if any part of the access falls outside the window.
+    /// Window offset for a data access of `bytes` at (masked) `addr`, or
+    /// None if it must take the bus: part of it falls outside the window,
+    /// or the PMMU cannot translate it without a table search. `write` asks
+    /// for write permission (a read-modify-write needs it too).
+    #[inline(always)]
+    fn data(self, cpu: &CpuCore, addr: u32, bytes: u32, write: bool) -> Option<usize> {
+        if TRANSLATED {
+            return cpu
+                .translated_window_off(addr, bytes, write, false)
+                .map(|off| off as usize);
+        }
+        self.off(addr, bytes)
+    }
+
+    /// Window offset for the instruction-stream word at (masked) `addr`.
+    #[inline(always)]
+    fn code(self, cpu: &CpuCore, addr: u32) -> Option<usize> {
+        if TRANSLATED {
+            return translated_code(cpu, addr);
+        }
+        self.off(addr, 2)
+    }
+
+    /// Window offset for an access of `bytes` at (masked) physical `addr`,
+    /// or None if any part of the access falls outside the window.
     #[inline]
     fn off(self, addr: u32, bytes: u32) -> Option<usize> {
         let o = addr.wrapping_sub(self.base);
@@ -661,6 +689,15 @@ impl Win {
             }
         }
     }
+}
+
+/// [`Win::code`] with the PMMU enabled: usually the page the decoded loop's
+/// opcode fetch just translated.
+#[inline(never)]
+fn translated_code(cpu: &CpuCore, addr: u32) -> Option<usize> {
+    cpu.remembered_code_off(addr)
+        .or_else(|| cpu.translated_window_off(addr, 2, false, true))
+        .map(|off| off as usize)
 }
 
 /// Deferred post-increment/pre-decrement address-register updates. Two
@@ -723,31 +760,38 @@ enum Loc {
 /// (full dispatch takes over with nothing committed), `Some(true)` when
 /// fully executed.
 #[inline]
-fn fast_move(cpu: &mut CpuCore, win: Win, size: Size, src: FastEa, dst: FastEa) -> Option<bool> {
+fn fast_move<const T: bool>(
+    cpu: &mut CpuCore,
+    win: Win<T>,
+    size: Size,
+    src: FastEa,
+    dst: FastEa,
+) -> Option<bool> {
     // (addr-register index, staged new value) for post-inc/pre-dec.
     let mut src_adj: Option<(usize, u32)> = None;
     let aligned_only = cpu.is_pre_68020;
 
     // Window offset for an access at `raw`, or an alignment/range miss.
-    let locate = |cpu: &CpuCore, raw: u32| -> Result<usize, ()> {
+    let locate = |cpu: &CpuCore, raw: u32, write: bool| -> Result<usize, ()> {
         if aligned_only && size != Size::Byte && (raw & 1) != 0 {
             return Err(());
         }
-        win.off(cpu.address(raw), size.bytes()).ok_or(())
+        win.data(cpu, cpu.address(raw), size.bytes(), write)
+            .ok_or(())
     };
 
     let value = match src {
         FastEa::DataReg(r) => cpu.dar[r as usize] & size.mask(),
         FastEa::AddrReg(r) => cpu.dar[8 + r as usize] & size.mask(),
         FastEa::AnInd(r) => {
-            let Ok(off) = locate(cpu, cpu.dar[8 + r as usize]) else {
+            let Ok(off) = locate(cpu, cpu.dar[8 + r as usize], false) else {
                 return Some(false);
             };
             win.read(off, size)
         }
         FastEa::AnPostInc(r) => {
             let a = cpu.dar[8 + r as usize];
-            let Ok(off) = locate(cpu, a) else {
+            let Ok(off) = locate(cpu, a, false) else {
                 return Some(false);
             };
             src_adj = Some((8 + r as usize, a.wrapping_add(ea_step(size, r))));
@@ -755,7 +799,7 @@ fn fast_move(cpu: &mut CpuCore, win: Win, size: Size, src: FastEa, dst: FastEa) 
         }
         FastEa::AnPreDec(r) => {
             let a = cpu.dar[8 + r as usize].wrapping_sub(ea_step(size, r));
-            let Ok(off) = locate(cpu, a) else {
+            let Ok(off) = locate(cpu, a, false) else {
                 return Some(false);
             };
             src_adj = Some((8 + r as usize, a));
@@ -795,7 +839,7 @@ fn fast_move(cpu: &mut CpuCore, win: Win, size: Size, src: FastEa, dst: FastEa) 
             };
         }
         FastEa::AnInd(r) => {
-            let Ok(off) = locate(cpu, addr_base(cpu, r)) else {
+            let Ok(off) = locate(cpu, addr_base(cpu, r), true) else {
                 return Some(false);
             };
             if let Some((idx, val)) = src_adj {
@@ -806,7 +850,7 @@ fn fast_move(cpu: &mut CpuCore, win: Win, size: Size, src: FastEa, dst: FastEa) 
         }
         FastEa::AnPostInc(r) => {
             let a = addr_base(cpu, r);
-            let Ok(off) = locate(cpu, a) else {
+            let Ok(off) = locate(cpu, a, true) else {
                 return Some(false);
             };
             if let Some((idx, val)) = src_adj {
@@ -818,7 +862,7 @@ fn fast_move(cpu: &mut CpuCore, win: Win, size: Size, src: FastEa, dst: FastEa) 
         }
         FastEa::AnPreDec(r) => {
             let a = addr_base(cpu, r).wrapping_sub(ea_step(size, r));
-            let Ok(off) = locate(cpu, a) else {
+            let Ok(off) = locate(cpu, a, true) else {
                 return Some(false);
             };
             if let Some((idx, val)) = src_adj {
@@ -836,8 +880,8 @@ fn fast_move(cpu: &mut CpuCore, win: Win, size: Size, src: FastEa, dst: FastEa) 
 /// Data-register-only MOVEM.W (An)+. The extension word and complete source
 /// span are checked before any destination register or An is changed.
 #[inline]
-fn fast_movem_word_postinc(cpu: &mut CpuCore, win: Win, base: u8) -> bool {
-    let Some(mask_off) = win.off(cpu.address(cpu.pc), 2) else {
+fn fast_movem_word_postinc<const T: bool>(cpu: &mut CpuCore, win: Win<T>, base: u8) -> bool {
+    let Some(mask_off) = win.code(cpu, cpu.address(cpu.pc)) else {
         return false;
     };
     let mask = win.read(mask_off, Size::Word) as u16;
@@ -854,7 +898,7 @@ fn fast_movem_word_postinc(cpu: &mut CpuCore, win: Win, base: u8) -> bool {
     if bytes > win.len || masked as u64 + bytes as u64 > cpu.address_mask as u64 + 1 {
         return false;
     }
-    let Some(mut off) = win.off(masked, bytes) else {
+    let Some(mut off) = win.data(cpu, masked, bytes, false) else {
         return false;
     };
 
@@ -872,8 +916,8 @@ fn fast_movem_word_postinc(cpu: &mut CpuCore, win: Win, base: u8) -> bool {
 
 /// BTST/BCHG/BCLR/BSET `#imm, Dn` — long-width register bit ops. Only Z is
 /// affected (from the pre-modification value), matching the slow path.
-fn fast_bit_imm_dreg(cpu: &mut CpuCore, win: Win, op: BitOp, reg: u8) -> bool {
-    let Some(ext_off) = win.off(cpu.address(cpu.pc), 2) else {
+fn fast_bit_imm_dreg<const T: bool>(cpu: &mut CpuCore, win: Win<T>, op: BitOp, reg: u8) -> bool {
+    let Some(ext_off) = win.code(cpu, cpu.address(cpu.pc)) else {
         return false;
     };
     let bit = win.read(ext_off, Size::Word) & 31;
@@ -893,18 +937,18 @@ fn fast_bit_imm_dreg(cpu: &mut CpuCore, win: Win, op: BitOp, reg: u8) -> bool {
 
 /// LINK An,#disp (word form). `LINK A7` has version-dependent semantics and
 /// bails to the slow path.
-fn fast_link(cpu: &mut CpuCore, win: Win, reg: u8) -> bool {
+fn fast_link<const T: bool>(cpu: &mut CpuCore, win: Win<T>, reg: u8) -> bool {
     if reg == 7 {
         return false;
     }
-    let Some(ext_off) = win.off(cpu.address(cpu.pc), 2) else {
+    let Some(ext_off) = win.code(cpu, cpu.address(cpu.pc)) else {
         return false;
     };
     let sp = cpu.dar[15].wrapping_sub(4);
     if cpu.is_pre_68020 && (sp & 1) != 0 {
         return false;
     }
-    let Some(off) = win.off(cpu.address(sp), 4) else {
+    let Some(off) = win.data(cpu, cpu.address(sp), 4, true) else {
         return false;
     };
     let disp = win.read(ext_off, Size::Word) as u16 as i16 as i32;
@@ -916,7 +960,7 @@ fn fast_link(cpu: &mut CpuCore, win: Win, reg: u8) -> bool {
 }
 
 /// UNLK An. `UNLK A7` bails to the slow path.
-fn fast_unlk(cpu: &mut CpuCore, win: Win, reg: u8) -> bool {
+fn fast_unlk<const T: bool>(cpu: &mut CpuCore, win: Win<T>, reg: u8) -> bool {
     if reg == 7 {
         return false;
     }
@@ -924,7 +968,7 @@ fn fast_unlk(cpu: &mut CpuCore, win: Win, reg: u8) -> bool {
     if cpu.is_pre_68020 && (sp & 1) != 0 {
         return false;
     }
-    let Some(off) = win.off(cpu.address(sp), 4) else {
+    let Some(off) = win.data(cpu, cpu.address(sp), 4, false) else {
         return false;
     };
     cpu.dar[8 + reg as usize] = win.read(off, Size::Long);
@@ -937,8 +981,8 @@ fn fast_unlk(cpu: &mut CpuCore, win: Win, reg: u8) -> bool {
 /// MOVEM.L list,-(An). Predecrement mask order: bit 0 = A7 … bit 15 = D0.
 /// Bails when the base register is in the list (version-dependent stored
 /// value) or anything misses the window.
-fn fast_movem_long_predec(cpu: &mut CpuCore, win: Win, base: u8) -> bool {
-    let Some(mask_off) = win.off(cpu.address(cpu.pc), 2) else {
+fn fast_movem_long_predec<const T: bool>(cpu: &mut CpuCore, win: Win<T>, base: u8) -> bool {
+    let Some(mask_off) = win.code(cpu, cpu.address(cpu.pc)) else {
         return false;
     };
     let mask = win.read(mask_off, Size::Word) as u16;
@@ -954,7 +998,7 @@ fn fast_movem_long_predec(cpu: &mut CpuCore, win: Win, base: u8) -> bool {
     if bytes > win.len {
         return false;
     }
-    let Some(mut off) = win.off(cpu.address(start), bytes) else {
+    let Some(mut off) = win.data(cpu, cpu.address(start), bytes, true) else {
         return false;
     };
     // Ascending memory order for predec is D0..D7, A0..A6 (mask bit 15-r for
@@ -973,8 +1017,8 @@ fn fast_movem_long_predec(cpu: &mut CpuCore, win: Win, base: u8) -> bool {
 
 /// MOVEM.L (An)+,list. Postincrement mask order: bit 0 = D0 … bit 15 = A7.
 /// Bails when the base register is in the list.
-fn fast_movem_long_postinc(cpu: &mut CpuCore, win: Win, base: u8) -> bool {
-    let Some(mask_off) = win.off(cpu.address(cpu.pc), 2) else {
+fn fast_movem_long_postinc<const T: bool>(cpu: &mut CpuCore, win: Win<T>, base: u8) -> bool {
+    let Some(mask_off) = win.code(cpu, cpu.address(cpu.pc)) else {
         return false;
     };
     let mask = win.read(mask_off, Size::Word) as u16;
@@ -989,7 +1033,7 @@ fn fast_movem_long_postinc(cpu: &mut CpuCore, win: Win, base: u8) -> bool {
     if bytes > win.len {
         return false;
     }
-    let Some(mut off) = win.off(cpu.address(raw), bytes) else {
+    let Some(mut off) = win.data(cpu, cpu.address(raw), bytes, false) else {
         return false;
     };
     for r in 0..16 {
@@ -1009,17 +1053,18 @@ fn fast_movem_long_postinc(cpu: &mut CpuCore, win: Win, base: u8) -> bool {
 /// Ctx/Pending/Loc state machine while retaining its all-checks-before-commit
 /// fallback contract.
 #[inline]
-fn fast_an_disp(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> Option<bool> {
+fn fast_an_disp<const T: bool>(cpu: &mut CpuCore, win: Win<T>, op: DecodedMemOp) -> Option<bool> {
     let read_word = |cpu: &CpuCore, pc: u32| -> Result<u32, ()> {
-        let off = win.off(cpu.address(pc), 2).ok_or(())?;
+        let off = win.code(cpu, cpu.address(pc)).ok_or(())?;
         Ok(win.read(off, Size::Word))
     };
-    let locate = |cpu: &CpuCore, reg: u8, disp: u32, size: Size| -> Result<usize, ()> {
+    let locate = |cpu: &CpuCore, reg: u8, disp: u32, size: Size, write: bool| {
         let raw = (cpu.dar[8 + reg as usize] as i32).wrapping_add(disp as u16 as i16 as i32) as u32;
         if cpu.is_pre_68020 && size != Size::Byte && (raw & 1) != 0 {
             return Err(());
         }
-        win.off(cpu.address(raw), size.bytes()).ok_or(())
+        win.data(cpu, cpu.address(raw), size.bytes(), write)
+            .ok_or(())
     };
 
     match op {
@@ -1031,7 +1076,7 @@ fn fast_an_disp(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> Option<bool> {
             let Ok(ext) = read_word(cpu, cpu.pc) else {
                 return Some(false);
             };
-            let Ok(off) = locate(cpu, src, ext, size) else {
+            let Ok(off) = locate(cpu, src, ext, size, false) else {
                 return Some(false);
             };
             let value = win.read(off, size);
@@ -1050,7 +1095,7 @@ fn fast_an_disp(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> Option<bool> {
             let Ok(ext) = read_word(cpu, cpu.pc) else {
                 return Some(false);
             };
-            let Ok(off) = locate(cpu, src, ext, size) else {
+            let Ok(off) = locate(cpu, src, ext, size, false) else {
                 return Some(false);
             };
             let value = win.read(off, size);
@@ -1075,7 +1120,7 @@ fn fast_an_disp(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> Option<bool> {
             let Ok(ext) = read_word(cpu, cpu.pc) else {
                 return Some(false);
             };
-            let Ok(off) = locate(cpu, dst, ext, size) else {
+            let Ok(off) = locate(cpu, dst, ext, size, true) else {
                 return Some(false);
             };
             let src_index = if matches!(
@@ -1103,14 +1148,14 @@ fn fast_an_disp(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> Option<bool> {
             let Ok(ext) = read_word(cpu, cpu.pc) else {
                 return Some(false);
             };
-            let Ok(src_off) = locate(cpu, src, ext, size) else {
+            let Ok(src_off) = locate(cpu, src, ext, size, false) else {
                 return Some(false);
             };
             let dst_addr = cpu.dar[8 + dst as usize].wrapping_sub(ea_step(size, dst));
             if cpu.is_pre_68020 && size != Size::Byte && (dst_addr & 1) != 0 {
                 return Some(false);
             }
-            let Some(dst_off) = win.off(cpu.address(dst_addr), size.bytes()) else {
+            let Some(dst_off) = win.data(cpu, cpu.address(dst_addr), size.bytes(), true) else {
                 return Some(false);
             };
             let value = win.read(src_off, size);
@@ -1131,10 +1176,10 @@ fn fast_an_disp(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> Option<bool> {
             let Ok(dst_ext) = read_word(cpu, cpu.pc.wrapping_add(2)) else {
                 return Some(false);
             };
-            let Ok(src_off) = locate(cpu, src, src_ext, size) else {
+            let Ok(src_off) = locate(cpu, src, src_ext, size, false) else {
                 return Some(false);
             };
-            let Ok(dst_off) = locate(cpu, dst, dst_ext, size) else {
+            let Ok(dst_off) = locate(cpu, dst, dst_ext, size, true) else {
                 return Some(false);
             };
             let value = win.read(src_off, size);
@@ -1150,7 +1195,7 @@ fn fast_an_disp(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> Option<bool> {
             let Ok(ext) = read_word(cpu, cpu.pc) else {
                 return Some(false);
             };
-            let Ok(off) = locate(cpu, reg, ext, size) else {
+            let Ok(off) = locate(cpu, reg, ext, size, false) else {
                 return Some(false);
             };
             cpu.set_logic_flags(win.read(off, size), size);
@@ -1164,7 +1209,7 @@ fn fast_an_disp(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> Option<bool> {
             let Ok(ext) = read_word(cpu, cpu.pc) else {
                 return Some(false);
             };
-            let Ok(off) = locate(cpu, reg, ext, size) else {
+            let Ok(off) = locate(cpu, reg, ext, size, true) else {
                 return Some(false);
             };
             win.write(off, size, 0);
@@ -1184,7 +1229,7 @@ fn fast_an_disp(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> Option<bool> {
             let Ok(ext) = read_word(cpu, cpu.pc) else {
                 return Some(false);
             };
-            let Ok(off) = locate(cpu, reg, ext, size) else {
+            let Ok(off) = locate(cpu, reg, ext, size, true) else {
                 return Some(false);
             };
             let dst = win.read(off, size);
@@ -1213,7 +1258,7 @@ fn fast_an_disp(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> Option<bool> {
             let Ok(ext) = read_word(cpu, cpu.pc.wrapping_add(2)) else {
                 return Some(false);
             };
-            let Ok(off) = locate(cpu, reg, ext, Size::Byte) else {
+            let Ok(off) = locate(cpu, reg, ext, Size::Byte, op != BitOp::Test) else {
                 return Some(false);
             };
             let bit = bit & 7;
@@ -1239,10 +1284,10 @@ fn fast_an_disp(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> Option<bool> {
 /// ops). Returns `false` on any window/alignment miss so full dispatch
 /// takes over with nothing committed.
 #[inline]
-fn fast_flow(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> bool {
+fn fast_flow<const T: bool>(cpu: &mut CpuCore, win: Win<T>, op: DecodedMemOp) -> bool {
     // One extension word at `pc` (the word after the opcode).
     let read_ext = |cpu: &CpuCore| -> Option<u32> {
-        let off = win.off(cpu.address(cpu.pc), 2)?;
+        let off = win.code(cpu, cpu.address(cpu.pc))?;
         Some(win.read(off, Size::Word))
     };
 
@@ -1269,7 +1314,7 @@ fn fast_flow(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> bool {
             if cpu.is_pre_68020 && (sp & 1) != 0 {
                 return false;
             }
-            let Some(off) = win.off(cpu.address(sp), 4) else {
+            let Some(off) = win.data(cpu, cpu.address(sp), 4, false) else {
                 return false;
             };
             let ret = win.read(off, Size::Long);
@@ -1296,7 +1341,7 @@ fn fast_flow(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> bool {
             if cpu.is_pre_68020 && (sp & 1) != 0 {
                 return false;
             }
-            let Some(off) = win.off(cpu.address(sp), 4) else {
+            let Some(off) = win.data(cpu, cpu.address(sp), 4, true) else {
                 return false;
             };
             win.write(off, Size::Long, ret);
@@ -1331,10 +1376,10 @@ fn ea_step(size: Size, reg: u8) -> u32 {
     }
 }
 
-#[inline]
-fn read_ext_word(cpu: &CpuCore, win: Win, ctx: &mut Ctx) -> Option<u32> {
+#[inline(always)]
+fn read_ext_word<const T: bool>(cpu: &CpuCore, win: Win<T>, ctx: &mut Ctx) -> Option<u32> {
     let addr = cpu.address(ctx.next_ext);
-    let off = win.off(addr, 2)?;
+    let off = win.code(cpu, addr)?;
     ctx.next_ext = ctx.next_ext.wrapping_add(2);
     Some(win.read(off, Size::Word))
 }
@@ -1375,63 +1420,71 @@ fn brief_index(cpu: &CpuCore, pending: &Pending, base: u32, ext: u32) -> Option<
 }
 
 /// Resolve one EA to a location, reading extension words and recording
-/// pending register updates. No CPU state is modified.
+/// pending register updates. `write` asks for write permission on a memory
+/// operand the instruction writes (or reads and writes). No CPU state is
+/// modified.
 #[inline(always)]
-fn resolve(cpu: &CpuCore, win: Win, ea: FastEa, size: Size, ctx: &mut Ctx) -> Option<Loc> {
-    let mem = |cpu: &CpuCore, ctx: &Ctx, raw: u32| -> Option<Loc> {
-        if ctx.aligned_only && size != Size::Byte && (raw & 1) != 0 {
-            return None;
-        }
-        let addr = cpu.address(raw);
-        Some(Loc::Mem(win.off(addr, size.bytes())?))
-    };
-
+fn resolve<const T: bool>(
+    cpu: &CpuCore,
+    win: Win<T>,
+    ea: FastEa,
+    size: Size,
+    write: bool,
+    ctx: &mut Ctx,
+) -> Option<Loc> {
     match ea {
         FastEa::DataReg(r) => Some(Loc::Reg(r as usize)),
         FastEa::AddrReg(r) => Some(Loc::Reg(8 + r as usize)),
-        FastEa::AnInd(r) => mem(cpu, ctx, ctx.pending.a(cpu, r)),
+        FastEa::AnInd(r) => resolve_mem(cpu, win, ctx, ctx.pending.a(cpu, r), size, write),
         FastEa::AnPostInc(r) => {
             let a = ctx.pending.a(cpu, r);
-            let loc = mem(cpu, ctx, a)?;
+            let loc = resolve_mem(cpu, win, ctx, a, size, write)?;
             ctx.pending.push(r, a.wrapping_add(ea_step(size, r)));
             Some(loc)
         }
         FastEa::AnPreDec(r) => {
             let a = ctx.pending.a(cpu, r).wrapping_sub(ea_step(size, r));
-            let loc = mem(cpu, ctx, a)?;
+            let loc = resolve_mem(cpu, win, ctx, a, size, write)?;
             ctx.pending.push(r, a);
             Some(loc)
         }
         FastEa::AnDisp(r) => {
             let d = read_ext_word(cpu, win, ctx)? as u16 as i16 as i32;
             let a = (ctx.pending.a(cpu, r) as i32).wrapping_add(d) as u32;
-            mem(cpu, ctx, a)
+            resolve_mem(cpu, win, ctx, a, size, write)
         }
         FastEa::AnIndex(r) => {
             let ext = read_ext_word(cpu, win, ctx)?;
             let a = brief_index(cpu, &ctx.pending, ctx.pending.a(cpu, r), ext)?;
-            mem(cpu, ctx, a)
+            resolve_mem(cpu, win, ctx, a, size, write)
         }
         FastEa::AbsW => {
             let a = read_ext_word(cpu, win, ctx)? as u16 as i16 as i32 as u32;
-            mem(cpu, ctx, a)
+            resolve_mem(cpu, win, ctx, a, size, write)
         }
         FastEa::AbsL => {
             let hi = read_ext_word(cpu, win, ctx)?;
             let lo = read_ext_word(cpu, win, ctx)?;
-            mem(cpu, ctx, (hi << 16) | lo)
+            resolve_mem(cpu, win, ctx, (hi << 16) | lo, size, write)
         }
         FastEa::PcDisp => {
             // Base is the address of the extension word itself.
             let base = ctx.next_ext;
             let d = read_ext_word(cpu, win, ctx)? as u16 as i16 as i32;
-            mem(cpu, ctx, (base as i32).wrapping_add(d) as u32)
+            resolve_mem(
+                cpu,
+                win,
+                ctx,
+                (base as i32).wrapping_add(d) as u32,
+                size,
+                write,
+            )
         }
         FastEa::PcIndex => {
             let base = ctx.next_ext;
             let ext = read_ext_word(cpu, win, ctx)?;
             let a = brief_index(cpu, &ctx.pending, base, ext)?;
-            mem(cpu, ctx, a)
+            resolve_mem(cpu, win, ctx, a, size, write)
         }
         FastEa::Imm => {
             let v = match size {
@@ -1448,8 +1501,32 @@ fn resolve(cpu: &CpuCore, win: Win, ea: FastEa, size: Size, ctx: &mut Ctx) -> Op
     }
 }
 
+/// The memory location of a `size` operand at `raw` for [`resolve`]. A
+/// function rather than a closure so it can be forced inline: `resolve`
+/// runs for every generic memory operand.
+#[inline(always)]
+fn resolve_mem<const T: bool>(
+    cpu: &CpuCore,
+    win: Win<T>,
+    ctx: &Ctx,
+    raw: u32,
+    size: Size,
+    write: bool,
+) -> Option<Loc> {
+    if ctx.aligned_only && size != Size::Byte && (raw & 1) != 0 {
+        return None;
+    }
+    let addr = cpu.address(raw);
+    Some(Loc::Mem(win.data(cpu, addr, size.bytes(), write)?))
+}
+
 /// Resolve a control EA (LEA/PEA/JMP/JSR) to a guest address (unmasked).
-fn resolve_control_addr(cpu: &CpuCore, win: Win, ea: FastEa, ctx: &mut Ctx) -> Option<u32> {
+fn resolve_control_addr<const T: bool>(
+    cpu: &CpuCore,
+    win: Win<T>,
+    ea: FastEa,
+    ctx: &mut Ctx,
+) -> Option<u32> {
     match ea {
         FastEa::AnInd(r) => Some(cpu.dar[8 + r as usize]),
         FastEa::AnDisp(r) => {
@@ -1481,7 +1558,7 @@ fn resolve_control_addr(cpu: &CpuCore, win: Win, ea: FastEa, ctx: &mut Ctx) -> O
 }
 
 #[inline(always)]
-fn load(cpu: &CpuCore, win: Win, loc: &Loc, size: Size) -> u32 {
+fn load<const T: bool>(cpu: &CpuCore, win: Win<T>, loc: &Loc, size: Size) -> u32 {
     match *loc {
         Loc::Reg(i) => cpu.dar[i] & size.mask(),
         Loc::Mem(off) => win.read(off, size),
@@ -1490,7 +1567,7 @@ fn load(cpu: &CpuCore, win: Win, loc: &Loc, size: Size) -> u32 {
 }
 
 #[inline(always)]
-fn store(cpu: &mut CpuCore, win: Win, loc: &Loc, size: Size, value: u32) {
+fn store<const T: bool>(cpu: &mut CpuCore, win: Win<T>, loc: &Loc, size: Size, value: u32) {
     match *loc {
         Loc::Reg(i) => {
             let mask = size.mask();
@@ -1512,8 +1589,13 @@ fn store(cpu: &mut CpuCore, win: Win, loc: &Loc, size: Size, value: u32) {
 /// host-visible bus transactions.
 #[cfg(feature = "trace-profile")]
 pub(crate) fn peek_window_word(cpu: &CpuCore, addr: u32) -> Option<u16> {
-    let win = Win::from_cpu(cpu)?;
-    let off = win.off(cpu.address(addr), 2)?;
+    if cpu.fm_mmu.enabled() {
+        let win = Win::<true>::from_cpu(cpu)?;
+        let off = win.code(cpu, cpu.address(addr))?;
+        return Some(win.read(off, Size::Word) as u16);
+    }
+    let win = Win::<false>::from_cpu(cpu)?;
+    let off = win.code(cpu, cpu.address(addr))?;
     Some(win.read(off, Size::Word) as u16)
 }
 
@@ -1523,7 +1605,22 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
     if cpu.fm_write_hook != 0 {
         return false;
     }
-    let Some(win) = Win::from_cpu(cpu) else {
+    if cpu.fm_mmu.enabled() {
+        return execute_translated_mem_op(cpu, op);
+    }
+    execute_mem_op_in::<false>(cpu, op)
+}
+
+/// [`execute_mem_op`] through a translated window, kept out of line so the
+/// physical executor inlines as it did before translation existed.
+#[inline(never)]
+fn execute_translated_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
+    execute_mem_op_in::<true>(cpu, op)
+}
+
+#[inline]
+fn execute_mem_op_in<const T: bool>(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
+    let Some(win) = Win::<T>::from_cpu(cpu) else {
         return false;
     };
 
@@ -1589,7 +1686,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
         | DecodedMemOp::MovemLongPreDec { .. }
         | DecodedMemOp::MovemLongPostInc { .. } => false,
         DecodedMemOp::Move { size, src, dst } => {
-            let Some(src_loc) = resolve(cpu, win, src, size, &mut ctx) else {
+            let Some(src_loc) = resolve(cpu, win, src, size, false, &mut ctx) else {
                 return false;
             };
             let value = load(cpu, win, &src_loc, size);
@@ -1605,7 +1702,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
                 finish_pc!();
                 return true;
             }
-            let Some(dst_loc) = resolve(cpu, win, dst, size, &mut ctx) else {
+            let Some(dst_loc) = resolve(cpu, win, dst, size, true, &mut ctx) else {
                 return false;
             };
             ctx.pending.commit(cpu);
@@ -1618,7 +1715,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
             unreachable!("MOVEM.W postincrement is handled by its fast path")
         }
         DecodedMemOp::AluToReg { op, size, src, dst } => {
-            let Some(src_loc) = resolve(cpu, win, src, size, &mut ctx) else {
+            let Some(src_loc) = resolve(cpu, win, src, size, false, &mut ctx) else {
                 return false;
             };
             let src_val = load(cpu, win, &src_loc, size);
@@ -1629,7 +1726,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
             true
         }
         DecodedMemOp::AluToMem { op, size, src, dst } => {
-            let Some(dst_loc) = resolve(cpu, win, dst, size, &mut ctx) else {
+            let Some(dst_loc) = resolve(cpu, win, dst, size, true, &mut ctx) else {
                 return false;
             };
             let dst_val = load(cpu, win, &dst_loc, size);
@@ -1653,7 +1750,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
             true
         }
         DecodedMemOp::AluAddr { op, size, src, dst } => {
-            let Some(src_loc) = resolve(cpu, win, src, size, &mut ctx) else {
+            let Some(src_loc) = resolve(cpu, win, src, size, false, &mut ctx) else {
                 return false;
             };
             let raw = load(cpu, win, &src_loc, size);
@@ -1680,12 +1777,13 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
         }
         DecodedMemOp::AluImm { op, size, dst } => {
             let imm = {
-                let Some(Loc::Imm(v)) = resolve(cpu, win, FastEa::Imm, size, &mut ctx) else {
+                let Some(Loc::Imm(v)) = resolve(cpu, win, FastEa::Imm, size, false, &mut ctx)
+                else {
                     return false;
                 };
                 v
             };
-            let Some(dst_loc) = resolve(cpu, win, dst, size, &mut ctx) else {
+            let Some(dst_loc) = resolve(cpu, win, dst, size, op != BinaryOp::Cmp, &mut ctx) else {
                 return false;
             };
             let dst_val = load(cpu, win, &dst_loc, size);
@@ -1715,7 +1813,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
             ea,
             is_sub,
         } => {
-            let Some(loc) = resolve(cpu, win, ea, size, &mut ctx) else {
+            let Some(loc) = resolve(cpu, win, ea, size, true, &mut ctx) else {
                 return false;
             };
             let dst_val = load(cpu, win, &loc, size);
@@ -1735,7 +1833,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
             true
         }
         DecodedMemOp::Tst { size, ea } => {
-            let Some(loc) = resolve(cpu, win, ea, size, &mut ctx) else {
+            let Some(loc) = resolve(cpu, win, ea, size, false, &mut ctx) else {
                 return false;
             };
             let value = load(cpu, win, &loc, size);
@@ -1745,7 +1843,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
             true
         }
         DecodedMemOp::Clr { size, ea } => {
-            let Some(loc) = resolve(cpu, win, ea, size, &mut ctx) else {
+            let Some(loc) = resolve(cpu, win, ea, size, true, &mut ctx) else {
                 return false;
             };
             ctx.pending.commit(cpu);
@@ -1758,7 +1856,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
             true
         }
         DecodedMemOp::Neg { size, ea } => {
-            let Some(loc) = resolve(cpu, win, ea, size, &mut ctx) else {
+            let Some(loc) = resolve(cpu, win, ea, size, true, &mut ctx) else {
                 return false;
             };
             let src = load(cpu, win, &loc, size);
@@ -1770,7 +1868,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
             true
         }
         DecodedMemOp::Not { size, ea } => {
-            let Some(loc) = resolve(cpu, win, ea, size, &mut ctx) else {
+            let Some(loc) = resolve(cpu, win, ea, size, true, &mut ctx) else {
                 return false;
             };
             let src = load(cpu, win, &loc, size);
@@ -1791,7 +1889,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
                     v
                 }
             } & 7;
-            let Some(loc) = resolve(cpu, win, ea, Size::Byte, &mut ctx) else {
+            let Some(loc) = resolve(cpu, win, ea, Size::Byte, op != BitOp::Test, &mut ctx) else {
                 return false;
             };
             let value = load(cpu, win, &loc, Size::Byte);
@@ -1807,11 +1905,13 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
             true
         }
         DecodedMemOp::CmpM { size, src, dst } => {
-            let Some(src_loc) = resolve(cpu, win, FastEa::AnPostInc(src), size, &mut ctx) else {
+            let Some(src_loc) = resolve(cpu, win, FastEa::AnPostInc(src), size, false, &mut ctx)
+            else {
                 return false;
             };
             let src_val = load(cpu, win, &src_loc, size);
-            let Some(dst_loc) = resolve(cpu, win, FastEa::AnPostInc(dst), size, &mut ctx) else {
+            let Some(dst_loc) = resolve(cpu, win, FastEa::AnPostInc(dst), size, false, &mut ctx)
+            else {
                 return false;
             };
             let dst_val = load(cpu, win, &dst_loc, size);
@@ -1837,7 +1937,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
             if ctx.aligned_only && (sp & 1) != 0 {
                 return false;
             }
-            let Some(off) = win.off(cpu.address(sp), 4) else {
+            let Some(off) = win.data(cpu, cpu.address(sp), 4, true) else {
                 return false;
             };
             win.write(off, Size::Long, addr);
@@ -1864,7 +1964,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
             if ctx.aligned_only && (sp & 1) != 0 {
                 return false;
             }
-            let Some(off) = win.off(cpu.address(sp), 4) else {
+            let Some(off) = win.data(cpu, cpu.address(sp), 4, true) else {
                 return false;
             };
             win.write(off, Size::Long, ret);
@@ -1878,7 +1978,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
             if ctx.aligned_only && (sp & 1) != 0 {
                 return false;
             }
-            let Some(off) = win.off(cpu.address(sp), 4) else {
+            let Some(off) = win.data(cpu, cpu.address(sp), 4, false) else {
                 return false;
             };
             let ret = win.read(off, Size::Long);
@@ -1905,7 +2005,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
             if ctx.aligned_only && (sp & 1) != 0 {
                 return false;
             }
-            let Some(off) = win.off(cpu.address(sp), 4) else {
+            let Some(off) = win.data(cpu, cpu.address(sp), 4, true) else {
                 return false;
             };
             win.write(off, Size::Long, ret);

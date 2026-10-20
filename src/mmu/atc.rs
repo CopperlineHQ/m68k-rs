@@ -135,7 +135,9 @@ struct Atc030Entry {
 ///
 /// Like the silicon it keeps only resident translations of whole pages (the
 /// page size TC configures, also for an early-termination descriptor that
-/// maps more), is replaced least recently used first, and is invalidated by
+/// maps more), is replaced least recently used first (in a `run_batch` with
+/// a translated fastmem window hits record no use, so entries age by load
+/// order there; see `mmu::probe_resident`), and is invalidated by
 /// PFLUSH and by a PMOVE to TC, SRP or CRP without FD. A CPU write to a
 /// descriptor does not reach it; software flushes, as on real hardware. A
 /// write to a write-protected page, and any access that would fault, re-walk
@@ -146,7 +148,7 @@ struct Atc030Entry {
 /// It is architectural state that decides how many descriptor fetches later
 /// accesses make, so it is serialized: a resumed machine misses where an
 /// uninterrupted one would.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Atc030 {
     entries: [Atc030Entry; ATC_030_ENTRIES],
@@ -157,7 +159,31 @@ pub struct Atc030 {
     clock: u64,
     /// Page shift the entries were made under (0 while empty).
     shift: u8,
+    /// Where each (function code, page) was last found, indexed by
+    /// [`Self::hint_slot`]. Instruction fetches and data accesses use
+    /// different function codes, so the MRU entry changes on almost every
+    /// access; the hint finds the other entry without searching all 22.
+    /// A hinted entry is checked before it is used, so a stale hint only
+    /// costs the search it failed to save. It decides nothing a lookup
+    /// returns or which entry an insert replaces, so it is neither
+    /// serialized nor compared.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    hints: [u8; ATC_030_HINTS],
 }
+
+/// Slots in [`Atc030`]'s lookup hint.
+const ATC_030_HINTS: usize = 32;
+
+impl PartialEq for Atc030 {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+            && self.mru == other.mru
+            && self.clock == other.clock
+            && self.shift == other.shift
+    }
+}
+
+impl Eq for Atc030 {}
 
 impl Default for Atc030 {
     fn default() -> Self {
@@ -166,11 +192,17 @@ impl Default for Atc030 {
             mru: 0,
             clock: 0,
             shift: 0,
+            hints: [0; ATC_030_HINTS],
         }
     }
 }
 
 impl Atc030 {
+    #[inline]
+    fn hint_slot(fc: u8, page: u32) -> usize {
+        (page as usize ^ (usize::from(fc) << 2)) & (ATC_030_HINTS - 1)
+    }
+
     /// The physical page base for `page` (logical address >> `shift`) in
     /// function-code space `fc`, or `None` on a miss. A write to a
     /// write-protected page misses, so the caller re-walks and faults.
@@ -185,13 +217,47 @@ impl Atc030 {
         let index = if hit(&self.entries[mru]) {
             mru
         } else {
-            let index = self.entries.iter().position(hit)?;
+            // At most one entry holds a (function code, page), so the hint
+            // finds the entry the search would.
+            let slot = Self::hint_slot(fc, page);
+            let hinted = usize::from(self.hints[slot]);
+            let index = if hinted < ATC_030_ENTRIES && hit(&self.entries[hinted]) {
+                hinted
+            } else {
+                let index = self.entries.iter().position(hit)?;
+                self.hints[slot] = index as u8;
+                index
+            };
             self.clock += 1;
             self.entries[index].stamp = self.clock;
             self.mru = index as u8;
             index
         };
         let e = &self.entries[index];
+        if write && e.write_protected {
+            return None;
+        }
+        Some(e.phys_page)
+    }
+
+    /// [`Self::lookup`] without recording a use: for `run_batch` while its
+    /// fastmem window translates, where no hit may record one (see
+    /// `mmu::probe_resident`), and for reads made on the side, such as the
+    /// trace recorder decoding code the CPU already fetched.
+    #[inline]
+    pub fn probe(&self, fc: u8, page: u32, shift: u32, write: bool) -> Option<u32> {
+        if u32::from(self.shift) != shift {
+            return None;
+        }
+        let hit = |e: &Atc030Entry| e.valid && e.page == page && e.fc == fc;
+        let hinted = usize::from(self.hints[Self::hint_slot(fc, page)]);
+        let e = if hit(&self.entries[usize::from(self.mru)]) {
+            &self.entries[usize::from(self.mru)]
+        } else if hinted < ATC_030_ENTRIES && hit(&self.entries[hinted]) {
+            &self.entries[hinted]
+        } else {
+            self.entries.iter().find(|e| hit(e))?
+        };
         if write && e.write_protected {
             return None;
         }
@@ -231,6 +297,7 @@ impl Atc030 {
             stamp: self.clock,
         };
         self.mru = index as u8;
+        self.hints[Self::hint_slot(fc, page)] = index as u8;
     }
 
     /// PFLUSHA, reset: invalidate every entry.
@@ -350,6 +417,50 @@ mod tests {
         atc.insert(1, 4, SHIFT, 0x0099_0000, true);
         assert_eq!(atc.valid_entries(), ATC_030_ENTRIES);
         assert_eq!(atc.lookup(1, 4, SHIFT, false), Some(0x0099_0000));
+    }
+
+    #[test]
+    fn atc_030_probe_answers_like_lookup_without_recording_a_use() {
+        let mut atc = Atc030::default();
+        for page in 0..ATC_030_ENTRIES as u32 {
+            atc.insert(1, page, SHIFT, page << SHIFT, page == 7);
+        }
+        let before = atc.clone();
+        for page in 0..ATC_030_ENTRIES as u32 + 2 {
+            for write in [false, true] {
+                assert_eq!(
+                    atc.probe(1, page, SHIFT, write),
+                    atc.clone().lookup(1, page, SHIFT, write),
+                    "page {page}, write {write}"
+                );
+            }
+        }
+        assert_eq!(atc.probe(2, 3, SHIFT, false), None, "other function code");
+        assert_eq!(atc.probe(1, 3, SHIFT + 1, false), None, "other page size");
+        assert_eq!(atc, before, "a probe changes nothing");
+        // Page 0 is the least recently used; probing it must not save it.
+        atc.insert(1, 100, SHIFT, 0x0064_0000, false);
+        assert_eq!(atc.probe(1, 0, SHIFT, false), None);
+    }
+
+    #[test]
+    fn atc_030_hint_never_changes_what_a_lookup_finds() {
+        // Pages 0 and 32 share a hint slot, so their hints keep replacing
+        // each other; every lookup must still find its own entry.
+        let mut atc = Atc030::default();
+        atc.insert(5, 0, SHIFT, 0x0010_0000, false);
+        atc.insert(5, 32, SHIFT, 0x0020_0000, false);
+        atc.insert(6, 1, SHIFT, 0x0030_0000, false);
+        for _ in 0..3 {
+            assert_eq!(atc.lookup(5, 0, SHIFT, false), Some(0x0010_0000));
+            assert_eq!(atc.lookup(6, 1, SHIFT, false), Some(0x0030_0000));
+            assert_eq!(atc.lookup(5, 32, SHIFT, false), Some(0x0020_0000));
+            assert_eq!(atc.probe(5, 0, SHIFT, false), Some(0x0010_0000));
+        }
+        // A flushed entry is not found through a hint that still names it.
+        atc.flush_fc_page(5, 7, 32 << SHIFT);
+        assert_eq!(atc.lookup(5, 32, SHIFT, false), None);
+        assert_eq!(atc.probe(5, 32, SHIFT, false), None);
     }
 
     #[test]

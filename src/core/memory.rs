@@ -40,6 +40,11 @@ pub struct BusFault {
 /// Buses with any interception (tracers, watchpoints, MMIO in range)
 /// must return `None` from `fast_mem` while that interception is active.
 /// `len` must be at least 4 bytes; smaller windows are ignored.
+///
+/// Guest addresses here are physical. With the PMMU enabled the batch path
+/// translates each access through the transparent-translation registers
+/// and the ATC (no table search) before using the window; an access they
+/// cannot map into it goes through the bus as usual.
 #[derive(Debug, Clone, Copy)]
 pub struct FastMem {
     /// Host pointer to the byte backing guest address `base`.

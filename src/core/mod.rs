@@ -23,3 +23,4 @@ pub mod trace_jit;
 #[cfg(feature = "trace-profile")]
 pub mod trace_profile;
 pub mod types;
+pub(crate) mod window;

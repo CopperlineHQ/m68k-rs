@@ -1233,6 +1233,18 @@ enum SlowTraceCodeValidation {
     Unavailable,
 }
 
+/// The bus address of the instruction-stream word at the address-masked
+/// `addr`: itself, or with the PMMU enabled its translation through the
+/// TT registers and ATC (`None` when only a table search could give one).
+#[inline]
+fn trace_code_bus_address(cpu: &CpuCore, addr: u32) -> Option<u32> {
+    if !cpu.fm_mmu.enabled() {
+        return Some(addr);
+    }
+    let phys = crate::mmu::probe_resident(cpu, cpu.fm_mmu, addr, false, true)?;
+    Some(cpu.address(phys))
+}
+
 /// Validate through the bus when fastmem validation fails, preserving the
 /// architecturally first changed instruction for the ordinary miss path.
 fn validate_trace_code_slow<B: AddressBus>(
@@ -1241,7 +1253,9 @@ fn validate_trace_code_slow<B: AddressBus>(
     bus: &mut B,
 ) -> SlowTraceCodeValidation {
     for (index, op) in trace.ops.iter().enumerate() {
-        let addr = cpu.address(op.pc);
+        let Some(addr) = trace_code_bus_address(cpu, cpu.address(op.pc)) else {
+            return SlowTraceCodeValidation::Unavailable;
+        };
         match bus.try_read_word(addr) {
             Ok(opcode) if opcode == op.opcode => {}
             Ok(opcode) => {
@@ -1256,7 +1270,10 @@ fn validate_trace_code_slow<B: AddressBus>(
 
         for (word_offset, expected) in [(2, op.extension), (4, op.extension2)] {
             let Some(expected) = expected else { continue };
-            let addr = cpu.address(op.pc.wrapping_add(word_offset));
+            let word = cpu.address(op.pc.wrapping_add(word_offset));
+            let Some(addr) = trace_code_bus_address(cpu, word) else {
+                return SlowTraceCodeValidation::Unavailable;
+            };
             match bus.try_read_word(addr) {
                 Ok(actual) if actual == expected => {}
                 Ok(_) => {
@@ -1278,19 +1295,59 @@ fn validate_trace_code<B: AddressBus>(
     cpu: &CpuCore,
     bus: &mut B,
 ) -> SlowTraceCodeValidation {
-    if cpu.fm_len != 0
-        && trace_code_segments_eq(
-            cpu.fm_ptr,
-            cpu.fm_base,
-            cpu.fm_len,
-            &trace.code,
-            &trace.code_segments,
-        )
-    {
+    let unchanged = if cpu.fm_mmu.enabled() {
+        translated_code_segments_eq(cpu, &trace.code, &trace.code_segments)
+    } else {
+        cpu.fm_len != 0
+            && trace_code_segments_eq(
+                cpu.fm_ptr,
+                cpu.fm_base,
+                cpu.fm_len,
+                &trace.code,
+                &trace.code_segments,
+            )
+    };
+    if unchanged {
         SlowTraceCodeValidation::Valid
     } else {
         validate_trace_code_slow(trace, cpu, bus)
     }
+}
+
+/// [`trace_code_segments_eq`] through a translated window: each segment is
+/// compared one page at a time, at the program-space translation of that
+/// page's first byte. False when any page cannot be translated without a
+/// table search or lies outside the window, leaving the bus validator to
+/// decide.
+fn translated_code_segments_eq(
+    cpu: &CpuCore,
+    expected_code: &[u8],
+    segments: &[TraceCodeSegment],
+) -> bool {
+    let page_mask = cpu.fm_mmu.page_mask;
+    for segment in segments {
+        let mut addr = segment.start;
+        let mut code_offset = segment.code_offset as usize;
+        let mut remaining = segment.len;
+        while remaining != 0 {
+            let in_page = (page_mask - (addr & page_mask)).saturating_add(1);
+            let chunk = remaining.min(in_page);
+            let Some(off) = cpu.translated_window_off(addr, chunk, false, true) else {
+                return false;
+            };
+            let expected = &expected_code[code_offset..code_offset + chunk as usize];
+            // SAFETY: the window lookup bounds `chunk` bytes from `off`, and
+            // `expected` has exactly `chunk` bytes.
+            let live = unsafe { (cpu.fm_ptr as *const u8).add(off as usize) };
+            if !unsafe { trace_code_eq(live, expected.as_ptr(), chunk as usize) } {
+                return false;
+            }
+            addr = cpu.address(addr.wrapping_add(chunk));
+            code_offset += chunk as usize;
+            remaining -= chunk;
+        }
+    }
+    true
 }
 
 struct CompiledTrace {
@@ -1325,6 +1382,11 @@ struct CompiledTrace {
     /// (i.e. inside `run_batch`).
     needs_window: bool,
     tracked_writes: bool,
+    /// Compiled while the PMMU was enabled: its code checks and memory
+    /// accesses translate logical addresses through the TT registers and
+    /// ATC into the window (`crate::core::window`). A trace runs only in
+    /// the mode it was compiled for.
+    translated: bool,
     /// Address-masked range of the trace's code bytes; trace stores into
     /// this range bail so self-modification is observed like the
     /// interpreter would. Baked into the compiled function on native
@@ -1764,7 +1826,11 @@ impl TraceJit {
         #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         self.module.as_ref()?;
 
-        if cpu.has_pmmu && cpu.pmmu_enabled || cpu.cycles_remaining <= 0 {
+        // With the PMMU enabled a trace needs the translated window
+        // `run_batch` installs: without it there is no way to check the code
+        // it was compiled from or to reach its memory operands.
+        let translated = cpu.fm_mmu.enabled();
+        if cpu.has_pmmu && cpu.pmmu_enabled && !translated || cpu.cycles_remaining <= 0 {
             return None;
         }
         if instr_budget == 0 {
@@ -1791,8 +1857,10 @@ impl TraceJit {
             self.poll_native_region(cpu.pc);
         }
 
+        // Native regions inline untranslated trace bodies only.
         #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         if self.native_region_enabled
+            && !translated
             && self
                 .native_region
                 .as_ref()
@@ -1849,6 +1917,17 @@ impl TraceJit {
                     .any(|&watched| trace.contains_interior_watch(cpu, watched)),
             };
             if interior_watched {
+                return None;
+            }
+            if trace.translated != translated {
+                // The PMMU was switched since compilation: the trace checks
+                // its code and reaches memory at addresses of the other kind
+                // (logical vs physical). Re-record it in the current mode.
+                self.slots[idx] = TraceSlot::Empty;
+                self.forget_structural_rejection(pc);
+                self.clear_linear_deferral(pc);
+                cpu.trace_record_skip = [TRACE_PC_NONE; 4];
+                cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
                 return None;
             }
             if trace.needs_window && cpu.fm_len == 0 {
@@ -3165,6 +3244,17 @@ impl TraceJit {
         executed_pc: u32,
         next_pc: u32,
     ) {
+        let mut code = RecorderCodeBus::new(cpu, bus, executed_pc);
+        self.record_executed_through(cpu, &mut code, executed_pc, next_pc);
+    }
+
+    fn record_executed_through<B: AddressBus>(
+        &mut self,
+        cpu: &mut CpuCore,
+        bus: &mut B,
+        executed_pc: u32,
+        next_pc: u32,
+    ) {
         let Some(recording) = self.recording.as_ref() else {
             cpu.trace_recording = false;
             return;
@@ -3741,6 +3831,7 @@ impl TraceJit {
             aligned_only: cpu.is_pre_68020,
             address_mask: cpu.address_mask,
             tracked_writes: cpu.fm_write_hook != 0,
+            translated: cpu.fm_mmu.enabled(),
         })
         .ok_or(RegionRejectReason::Backend)
     }
@@ -3759,6 +3850,7 @@ impl TraceJit {
             self_loop,
             needs_window,
             tracked_writes,
+            translated,
             code_start,
             code_end,
             aligned_only,
@@ -3778,7 +3870,10 @@ impl TraceJit {
         // One through three short segments cover over 90% of SC2K entries.
         // Its one wider hot shape is a contiguous 50-byte region; other wide
         // and unusually fragmented traces retain the shared SIMD comparator.
+        // A translated trace's code lives wherever the ATC maps it, so its
+        // entry checks are made in Rust through the translation instead.
         let generated_code_validation = cfg!(target_arch = "x86_64")
+            && !translated
             && code_segments.len() <= 3
             && (code_segments.iter().all(|segment| segment.len <= 47)
                 || matches!(code_segments.as_slice(), [segment] if segment.len == 50));
@@ -3848,8 +3943,22 @@ impl TraceJit {
                     hook_sig.params.push(AbiParam::new(types::I32));
                 }
                 let hook_sig = builder.import_signature(hook_sig);
+                let mut translate_sig = module.make_signature();
+                translate_sig.params.push(AbiParam::new(ptr_ty));
+                translate_sig.params.push(AbiParam::new(types::I32));
+                translate_sig.params.push(AbiParam::new(types::I32));
+                translate_sig.returns.push(AbiParam::new(types::I32));
+                let translate_sig = builder.import_signature(translate_sig);
+                let translate_fn = builder.ins().iconst(
+                    ptr_ty,
+                    crate::core::window::trace_window_off as *const () as usize as i64,
+                );
                 Some(MemEnv {
                     tracked_writes,
+                    translated,
+                    cpu: cpu_ptr,
+                    translate_sig,
+                    translate_fn,
                     fm_ptr,
                     fm_bus,
                     fm_hook,
@@ -4385,6 +4494,7 @@ impl TraceJit {
             callee_end,
             needs_window,
             tracked_writes,
+            translated,
             code_start,
             code_end,
             #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
@@ -4421,6 +4531,7 @@ impl TraceJit {
             seeded_exit,
             needs_window: params.needs_window,
             tracked_writes: params.tracked_writes,
+            translated: params.translated,
             code_start: params.code_start,
             code_end: params.code_end,
             #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
@@ -4444,6 +4555,7 @@ struct CompileParams<'a> {
     self_loop: bool,
     needs_window: bool,
     tracked_writes: bool,
+    translated: bool,
     code_start: u32,
     code_end: u32,
     callee_start: u32,
@@ -4678,6 +4790,113 @@ fn decode_call_op<B: AddressBus>(
             cycles: 18,
         },
     })
+}
+
+/// The bus as the trace recorder sees it while it decodes the instruction
+/// the interpreter just executed (and the few words after it that a
+/// skipped block or call extension may occupy). Without an enabled PMMU it
+/// is the bus itself. With one, the recorder's addresses are logical
+/// program-space addresses: this view reads them at the translation of the
+/// executed instruction's page and of the page after it, found through the
+/// TT registers and ATC without disturbing the ATC's replacement order, and
+/// fails any read it cannot translate that way -- the decoder then gives up
+/// on the instruction, which ends the recording rather than recording code
+/// it could not see.
+struct RecorderCodeBus<'a, B> {
+    bus: &'a mut B,
+    pages: Option<RecorderCodePages>,
+}
+
+/// Program-space translations of the recorded instruction's page and the
+/// next one, as physical page bases.
+#[derive(Clone, Copy)]
+struct RecorderCodePages {
+    first: u32,
+    page_mask: u32,
+    address_mask: u32,
+    phys: [Option<u32>; 2],
+}
+
+impl<'a, B: AddressBus> RecorderCodeBus<'a, B> {
+    fn new(cpu: &CpuCore, bus: &'a mut B, pc: u32) -> Self {
+        let mmu = cpu.fm_mmu;
+        let pages = mmu.enabled().then(|| {
+            let page_mask = mmu.page_mask;
+            let first = cpu.address(pc) & !page_mask;
+            let second = cpu.address(first.wrapping_add(page_mask).wrapping_add(1));
+            let phys = |page: u32| crate::mmu::probe_resident(cpu, mmu, page, false, true);
+            RecorderCodePages {
+                first,
+                page_mask,
+                address_mask: cpu.address_mask,
+                phys: [phys(first), phys(second)],
+            }
+        });
+        Self { bus, pages }
+    }
+
+    /// The bus address of the address-masked `addr`, if it can be read.
+    #[inline]
+    fn bus_address(&self, addr: u32) -> Option<u32> {
+        let Some(pages) = self.pages else {
+            return Some(addr);
+        };
+        let page = addr & !pages.page_mask;
+        let second = page.wrapping_sub(pages.first) & pages.address_mask;
+        let index = if page == pages.first {
+            0
+        } else if second == pages.page_mask.wrapping_add(1) {
+            1
+        } else {
+            return None;
+        };
+        let phys = pages.phys[index]?.wrapping_add(addr & pages.page_mask);
+        Some(phys & pages.address_mask)
+    }
+}
+
+/// A read the recorder's view cannot make.
+fn recorder_unreadable(address: u32) -> crate::core::memory::BusFault {
+    crate::core::memory::BusFault {
+        kind: crate::core::memory::BusFaultKind::BusError,
+        address,
+    }
+}
+
+impl<B: AddressBus> AddressBus for RecorderCodeBus<'_, B> {
+    fn read_byte(&mut self, address: u32) -> u8 {
+        self.bus_address(address)
+            .map_or(0, |at| self.bus.read_byte(at))
+    }
+    fn read_word(&mut self, address: u32) -> u16 {
+        self.bus_address(address)
+            .map_or(0, |at| self.bus.read_word(at))
+    }
+    fn read_long(&mut self, address: u32) -> u32 {
+        self.bus_address(address)
+            .map_or(0, |at| self.bus.read_long(at))
+    }
+    fn write_byte(&mut self, address: u32, value: u8) {
+        if let Some(at) = self.bus_address(address) {
+            self.bus.write_byte(at, value);
+        }
+    }
+    fn write_word(&mut self, address: u32, value: u16) {
+        if let Some(at) = self.bus_address(address) {
+            self.bus.write_word(at, value);
+        }
+    }
+    fn write_long(&mut self, address: u32, value: u32) {
+        if let Some(at) = self.bus_address(address) {
+            self.bus.write_long(at, value);
+        }
+    }
+    fn try_read_word(&mut self, address: u32) -> Result<u16, crate::core::memory::BusFault> {
+        match self.bus_address(address) {
+            Some(at) => self.bus.try_read_word(at),
+            None => Err(recorder_unreadable(address)),
+        }
+    }
 }
 
 /// Attempt to execute a compiled trace at the current PC. See
@@ -6993,16 +7212,10 @@ fn execute_portable_movem_word_postinc(cpu: &mut CpuCore, trace: TraceBuildOp) -
         return None;
     }
     let masked = raw & cpu.address_mask;
-    if bytes == 0
-        || bytes > cpu.fm_len
-        || masked as u64 + bytes as u64 > cpu.address_mask as u64 + 1
-    {
+    if bytes == 0 || masked as u64 + bytes as u64 > cpu.address_mask as u64 + 1 {
         return None;
     }
-    let off = masked.wrapping_sub(cpu.fm_base);
-    if off > cpu.fm_len - bytes {
-        return None;
-    }
+    let off = cpu.window_range_off(masked, bytes, false)?;
 
     let mut next_off = off as usize;
     for reg in 0..8 {
@@ -7040,13 +7253,9 @@ fn execute_portable_movem_long_predec(
         return None;
     }
     let masked = new_base & cpu.address_mask;
-    let off = masked.wrapping_sub(cpu.fm_base);
-    // A window shorter than the whole transfer would wrap the limit into a
-    // large unsigned value and accept any offset; reject it first, as the
-    // word-MOVEM helper does.
-    if total > cpu.fm_len || off > cpu.fm_len - total {
-        return None;
-    }
+    // A window shorter than the whole transfer is rejected by the lookup
+    // before its limit arithmetic could wrap, as the word-MOVEM helper does.
+    let off = cpu.window_range_off(masked, total, true)?;
     // The whole transfer must miss both code intervals: the caller's and,
     // for a call-through trace, the callee's.
     if spans.store_hits_code(masked, total) {
@@ -7080,12 +7289,9 @@ fn execute_portable_movem_long_postinc(cpu: &mut CpuCore, trace: TraceBuildOp) -
     if cpu.is_pre_68020 && (base_val & 1) != 0 {
         return None;
     }
-    let off = (base_val & cpu.address_mask).wrapping_sub(cpu.fm_base);
     // See the predecrement path: a short window must bail before the
     // limit arithmetic wraps.
-    if total > cpu.fm_len || off > cpu.fm_len - total {
-        return None;
-    }
+    let off = cpu.window_range_off(base_val & cpu.address_mask, total, false)?;
     for (slot, reg) in movem_postinc_regs_ascending(mask).enumerate() {
         let value = unsafe {
             let p = (cpu.fm_ptr as *const u8).add(off as usize + 4 * slot);
@@ -7204,10 +7410,7 @@ fn execute_portable_link(cpu: &mut CpuCore, trace: TraceBuildOp, spans: CodeSpan
         return None;
     }
     let masked = new_sp & cpu.address_mask;
-    let off = masked.wrapping_sub(cpu.fm_base);
-    if off > cpu.fm_len - 4 {
-        return None;
-    }
+    let off = cpu.window_off(masked, 4, true, false)?;
     if spans.store_hits_code(masked, 4) {
         return None;
     }
@@ -7237,10 +7440,7 @@ fn execute_portable_unlk(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> 
     if cpu.is_pre_68020 && (addr & 1) != 0 {
         return None;
     }
-    let off = (addr & cpu.address_mask).wrapping_sub(cpu.fm_base);
-    if off > cpu.fm_len - 4 {
-        return None;
-    }
+    let off = cpu.window_off(addr & cpu.address_mask, 4, false, false)?;
     let value = unsafe {
         let p = (cpu.fm_ptr as *const u8).add(off as usize);
         u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
@@ -7507,12 +7707,7 @@ fn execute_portable_move_imm_mem(
         if cpu.fm_len == 0 {
             return None;
         }
-        let off = (raw & cpu.address_mask).wrapping_sub(cpu.fm_base);
-        if off <= cpu.fm_len - bytes {
-            Some(off)
-        } else {
-            None
-        }
+        cpu.window_off(raw & cpu.address_mask, bytes, true, false)
     };
     let write = |cpu: &mut CpuCore, off: u32, value: u32| unsafe {
         let p = (cpu.fm_ptr as *mut u8).add(off as usize);
@@ -7625,8 +7820,8 @@ fn execute_portable_and_imm_byte_mem(
         return None;
     }
     let masked = raw & cpu.address_mask;
-    let off = masked.wrapping_sub(cpu.fm_base);
-    if off >= cpu.fm_len || spans.store_hits_code(masked, 1) {
+    let off = cpu.window_off(masked, 1, true, false)?;
+    if spans.store_hits_code(masked, 1) {
         return None;
     }
     let ptr = unsafe { (cpu.fm_ptr as *mut u8).add(off as usize) };
@@ -7755,19 +7950,14 @@ fn execute_portable_move_mem(
 ) -> Option<i32> {
     let bytes = size.bytes();
     let aligned_only = cpu.is_pre_68020;
-    let locate = |cpu: &CpuCore, raw: u32| -> Option<u32> {
+    let locate = |cpu: &CpuCore, raw: u32, write: bool| -> Option<u32> {
         if aligned_only && size != Size::Byte && (raw & 1) != 0 {
             return None;
         }
         if cpu.fm_len == 0 {
             return None;
         }
-        let off = (raw & cpu.address_mask).wrapping_sub(cpu.fm_base);
-        if off <= cpu.fm_len - bytes {
-            Some(off)
-        } else {
-            None
-        }
+        cpu.window_off(raw & cpu.address_mask, bytes, write, false)
     };
     let read = |cpu: &CpuCore, off: u32| -> u32 {
         unsafe {
@@ -7802,22 +7992,22 @@ fn execute_portable_move_mem(
     let value = match src {
         JitEa::Data(r) => cpu.dar[r as usize] & size.mask(),
         JitEa::Addr(r) => cpu.dar[8 + r as usize] & size.mask(),
-        JitEa::Ind(r) => read(cpu, locate(cpu, cpu.dar[8 + r as usize])?),
+        JitEa::Ind(r) => read(cpu, locate(cpu, cpu.dar[8 + r as usize], false)?),
         JitEa::PostInc(r) => {
             let a = cpu.dar[8 + r as usize];
-            let off = locate(cpu, a)?;
+            let off = locate(cpu, a, false)?;
             staged = Some((8 + r as usize, a.wrapping_add(jit_ea_step(size, r))));
             read(cpu, off)
         }
         JitEa::PreDec(r) => {
             let a = cpu.dar[8 + r as usize].wrapping_sub(jit_ea_step(size, r));
-            let off = locate(cpu, a)?;
+            let off = locate(cpu, a, false)?;
             staged = Some((8 + r as usize, a));
             read(cpu, off)
         }
         JitEa::Disp(r, displacement) => {
             let a = cpu.dar[8 + r as usize].wrapping_add(displacement as i32 as u32);
-            read(cpu, locate(cpu, a)?)
+            read(cpu, locate(cpu, a, false)?)
         }
         JitEa::Index {
             base,
@@ -7839,7 +8029,7 @@ fn execute_portable_move_mem(
             let a = base
                 .wrapping_add(index.wrapping_shl(scale as u32))
                 .wrapping_add(displacement as i32 as u32);
-            read(cpu, locate(cpu, a)?)
+            read(cpu, locate(cpu, a, false)?)
         }
         JitEa::PcIndex {
             base,
@@ -7857,10 +8047,10 @@ fn execute_portable_move_mem(
                 raw_index as u16 as i16 as i32 as u32
             };
             let a = base.wrapping_add(index.wrapping_shl(scale as u32));
-            read(cpu, locate(cpu, a)?)
+            read(cpu, locate(cpu, a, false)?)
         }
         JitEa::PcDisp(address) | JitEa::AbsWord(address) | JitEa::AbsLong(address) => {
-            read(cpu, locate(cpu, address)?)
+            read(cpu, locate(cpu, address, false)?)
         }
     };
 
@@ -7906,7 +8096,7 @@ fn execute_portable_move_mem(
                 }
                 _ => unreachable!(),
             };
-            let off = locate(cpu, addr)?;
+            let off = locate(cpu, addr, true)?;
             let masked = addr & cpu.address_mask;
             // Self-modification guard, as in the compiled version.
             if spans.store_hits_code(masked, bytes) {
@@ -7922,7 +8112,7 @@ fn execute_portable_move_mem(
             cpu.set_logic_flags(value, size);
         }
         JitEa::AbsWord(address) | JitEa::AbsLong(address) => {
-            let off = locate(cpu, address)?;
+            let off = locate(cpu, address, true)?;
             let masked = address & cpu.address_mask;
             if spans.store_hits_code(masked, bytes) {
                 return None;
@@ -7959,7 +8149,7 @@ fn execute_portable_move_mem(
             let addr = base_value
                 .wrapping_add(index_value << scale)
                 .wrapping_add(displacement as i32 as u32);
-            let off = locate(cpu, addr)?;
+            let off = locate(cpu, addr, true)?;
             let masked = addr & cpu.address_mask;
             if spans.store_hits_code(masked, bytes) {
                 return None;
@@ -9351,6 +9541,12 @@ fn emit_jit_op(
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
 struct MemEnv {
     tracked_writes: bool,
+    /// Translate every access through `crate::core::window::trace_window_off`
+    /// (the trace was compiled with the PMMU enabled).
+    translated: bool,
+    cpu: Value,
+    translate_sig: cranelift_codegen::ir::SigRef,
+    translate_fn: Value,
     fm_ptr: Value,
     fm_bus: Value,
     fm_hook: Value,
@@ -9408,7 +9604,8 @@ fn branch_guard(builder: &mut FunctionBuilder<'_>, bail: Block, bad: Value) {
 
 /// Alignment + window-range checks for an access of `size` at raw address
 /// `addr`. Returns `(window_offset, masked_address)`; branches to `bail`
-/// on any miss.
+/// on any miss. `write` marks an access that writes (alone or after a
+/// read), which a translated trace needs write permission for.
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn checked_window_off(
     builder: &mut FunctionBuilder<'_>,
@@ -9416,6 +9613,7 @@ fn checked_window_off(
     bail: Block,
     addr: Value,
     size: Size,
+    write: bool,
 ) -> (Value, Value) {
     if env.aligned_only && size != Size::Byte {
         let low = builder.ins().band_imm(addr, 1);
@@ -9423,11 +9621,42 @@ fn checked_window_off(
         branch_guard(builder, bail, bad);
     }
     let masked = builder.ins().band_imm(addr, env.address_mask as i64);
+    if env.translated {
+        let off = translated_window_off(builder, env, bail, masked, size.bytes(), write);
+        return (off, masked);
+    }
     let off = builder.ins().isub(masked, env.fm_base);
     let limit = builder.ins().iadd_imm(env.fm_len, -(size.bytes() as i64));
     let bad = builder.ins().icmp(IntCC::UnsignedGreaterThan, off, limit);
     branch_guard(builder, bail, bad);
     (off, masked)
+}
+
+/// The window offset of a `bytes`-long data access at the logical `masked`
+/// address in a translated trace, from `crate::core::window::trace_window_off`;
+/// branches to `bail` when the ATC cannot map it into the window (the
+/// interpreter then performs the access, searching the tables and raising
+/// any fault).
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn translated_window_off(
+    builder: &mut FunctionBuilder<'_>,
+    env: &MemEnv,
+    bail: Block,
+    masked: Value,
+    bytes: u32,
+    write: bool,
+) -> Value {
+    let request = iconst_u32(builder, bytes | if write { 0x100 } else { 0 });
+    let call = builder.ins().call_indirect(
+        env.translate_sig,
+        env.translate_fn,
+        &[env.cpu, masked, request],
+    );
+    let off = builder.inst_results(call)[0];
+    let none = iconst_u32(builder, u32::MAX);
+    let bad = builder.ins().icmp(IntCC::Equal, off, none);
+    branch_guard(builder, bail, bad);
+    off
 }
 
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
@@ -9506,14 +9735,20 @@ fn emit_movem_word_postinc(
         i64::from(last_valid_start),
     );
     branch_guard(builder, bail, wraps);
-    let too_short = builder
-        .ins()
-        .icmp_imm(IntCC::UnsignedLessThan, env.fm_len, i64::from(bytes));
-    branch_guard(builder, bail, too_short);
-    let off = builder.ins().isub(masked, env.fm_base);
-    let limit = builder.ins().iadd_imm(env.fm_len, -i64::from(bytes));
-    let outside = builder.ins().icmp(IntCC::UnsignedGreaterThan, off, limit);
-    branch_guard(builder, bail, outside);
+    let off = if env.translated {
+        translated_window_off(builder, env, bail, masked, bytes, false)
+    } else {
+        let too_short =
+            builder
+                .ins()
+                .icmp_imm(IntCC::UnsignedLessThan, env.fm_len, i64::from(bytes));
+        branch_guard(builder, bail, too_short);
+        let off = builder.ins().isub(masked, env.fm_base);
+        let limit = builder.ins().iadd_imm(env.fm_len, -i64::from(bytes));
+        let outside = builder.ins().icmp(IntCC::UnsignedGreaterThan, off, limit);
+        branch_guard(builder, bail, outside);
+        off
+    };
 
     let mut ordinal = 0i64;
     for reg in 0..8 {
@@ -9560,7 +9795,7 @@ fn emit_movem_long_predec(
     let total = 4 * mask.count_ones();
     let base_val = load_reg(builder, cpu, JitDirectReg::Addr(base));
     let new_base = builder.ins().iadd_imm(base_val, -(total as i64));
-    let (off, masked) = checked_window_off_range(builder, env, bail, new_base, total);
+    let (off, masked) = checked_window_off_range(builder, env, bail, new_base, total, true);
     guard_store_range_not_code(builder, env, bail, masked, total);
     for (slot, reg) in movem_predec_regs_ascending(mask).enumerate() {
         let direct = if reg < 8 {
@@ -9599,7 +9834,7 @@ fn emit_movem_long_postinc(
     });
     let total = 4 * mask.count_ones();
     let base_val = load_reg(builder, cpu, JitDirectReg::Addr(base));
-    let (off, _) = checked_window_off_range(builder, env, bail, base_val, total);
+    let (off, _) = checked_window_off_range(builder, env, bail, base_val, total, false);
     for (slot, reg) in movem_postinc_regs_ascending(mask).enumerate() {
         let slot_off = builder.ins().iadd_imm(off, 4 * slot as i64);
         let value = window_load(builder, env, slot_off, Size::Long);
@@ -9636,6 +9871,9 @@ fn window_store_with_copy(
     source: Option<Value>,
 ) {
     if env.tracked_writes {
+        // The bus is told of memory-to-memory copies only while the PMMU is
+        // disabled (`AddressBus::begin_memory_copy`).
+        let source = if env.translated { None } else { source };
         let address = builder.ins().iadd(env.fm_base, off);
         // With a bus store filter, a store whose pages (and copy-source pages)
         // the bus reports as plain RAM is written directly; anything else, or
@@ -9775,11 +10013,17 @@ fn checked_window_off_range(
     bail: Block,
     addr: Value,
     bytes: u32,
+    write: bool,
 ) -> (Value, Value) {
     if env.aligned_only {
         let low = builder.ins().band_imm(addr, 1);
         let bad = builder.ins().icmp_imm(IntCC::NotEqual, low, 0);
         branch_guard(builder, bail, bad);
+    }
+    if env.translated {
+        let masked = builder.ins().band_imm(addr, env.address_mask as i64);
+        let off = translated_window_off(builder, env, bail, masked, bytes, write);
+        return (off, masked);
     }
     // A window shorter than the whole transfer must bail before the limit
     // below wraps to a large unsigned value and admits every offset.
@@ -9881,7 +10125,7 @@ fn emit_tst_mem(
         JitEa::AbsWord(address) | JitEa::AbsLong(address) => iconst_u32(builder, address),
         _ => unreachable!("memory TST decoder admitted an unsupported EA"),
     };
-    let (off, _) = checked_window_off(builder, env, bail, address, size);
+    let (off, _) = checked_window_off(builder, env, bail, address, size, false);
     let value = window_load(builder, env, off, size);
     set_logic_flags(builder, cpu, value, size);
     cycles_const(builder, trace.op.max_cycles())
@@ -9944,7 +10188,7 @@ fn emit_clr_mem(
         JitEa::AbsWord(address) | JitEa::AbsLong(address) => (iconst_u32(builder, address), None),
         _ => unreachable!("memory CLR decoder admitted an unsupported EA"),
     };
-    let (off, masked) = checked_window_off(builder, env, bail, address, size);
+    let (off, masked) = checked_window_off(builder, env, bail, address, size, true);
     guard_store_not_code(builder, env, bail, masked, size);
     if let Some((reg, value)) = updated_reg {
         store_reg(builder, cpu, JitDirectReg::Addr(reg), value);
@@ -10025,7 +10269,7 @@ fn emit_move_imm_mem(
         }
         _ => unreachable!("immediate MOVE decoder admitted an unsupported EA"),
     };
-    let (off, masked) = checked_window_off(builder, env, bail, address, size);
+    let (off, masked) = checked_window_off(builder, env, bail, address, size, true);
     guard_store_not_code(builder, env, bail, masked, size);
     if let Some((reg, next)) = updated_reg {
         store_reg(builder, cpu, JitDirectReg::Addr(reg), next);
@@ -10083,7 +10327,7 @@ fn emit_and_imm_byte_mem(
     };
     let address = builder.ins().iadd(base, index);
     let address = builder.ins().iadd_imm(address, displacement as i64);
-    let (off, masked) = checked_window_off(builder, env, bail, address, Size::Byte);
+    let (off, masked) = checked_window_off(builder, env, bail, address, Size::Byte, true);
     guard_store_not_code(builder, env, bail, masked, Size::Byte);
     let old = window_load(builder, env, off, Size::Byte);
     let immediate = iconst_u32(builder, u32::from(immediate));
@@ -10146,7 +10390,7 @@ fn emit_alu_mem_to_reg(
         }
         _ => unreachable!("ALU trace decoder admitted an unsupported EA"),
     };
-    let (off, _) = checked_window_off(builder, env, bail, addr, size);
+    let (off, _) = checked_window_off(builder, env, bail, addr, size, false);
     let src_value = window_load(builder, env, off, size);
     let dst_value = load_reg(builder, cpu, JitDirectReg::Data(dst));
     let dst_value = mask_value(builder, dst_value, size);
@@ -10232,7 +10476,7 @@ fn emit_cmpi_word_mem(
         }
         _ => unreachable!("memory CMPI decoder admitted an unsupported EA"),
     };
-    let (off, _) = checked_window_off(builder, env, bail, address, Size::Word);
+    let (off, _) = checked_window_off(builder, env, bail, address, Size::Word, false);
     let dst_value = window_load(builder, env, off, Size::Word);
     let immediate = iconst_u32(builder, u32::from(immediate));
     let result = builder.ins().isub(dst_value, immediate);
@@ -10263,7 +10507,7 @@ fn emit_cmpi_byte_abs(
     });
 
     let address = iconst_u32(builder, address);
-    let (off, _) = checked_window_off(builder, env, bail, address, Size::Byte);
+    let (off, _) = checked_window_off(builder, env, bail, address, Size::Byte, false);
     let dst_value = window_load(builder, env, off, Size::Byte);
     let immediate = iconst_u32(builder, u32::from(immediate));
     let result = builder.ins().isub(dst_value, immediate);
@@ -10301,7 +10545,7 @@ fn emit_addr_cmp_mem_to_reg(
         }
         _ => unreachable!("address compare decoder admitted unsupported EA"),
     };
-    let (off, _) = checked_window_off(builder, env, bail, address, size);
+    let (off, _) = checked_window_off(builder, env, bail, address, size, false);
     let src_value = window_load(builder, env, off, size);
     let src_value = if size == Size::Word {
         sign_extend_word(builder, src_value)
@@ -10344,7 +10588,7 @@ fn emit_adda_mem_to_reg(
         }
         _ => unreachable!("address add decoder admitted unsupported EA"),
     };
-    let (off, _) = checked_window_off(builder, env, bail, address, size);
+    let (off, _) = checked_window_off(builder, env, bail, address, size, false);
     let src_value = window_load(builder, env, off, size);
     let src_value = if size == Size::Word {
         sign_extend_word(builder, src_value)
@@ -10402,7 +10646,7 @@ fn emit_add_reg_to_mem(
         }
         _ => unreachable!("unsupported register-to-memory ADD/SUB destination"),
     };
-    let (off, masked) = checked_window_off(builder, env, bail, addr, size);
+    let (off, masked) = checked_window_off(builder, env, bail, addr, size, true);
     guard_store_not_code(builder, env, bail, masked, size);
     let dst_value = window_load(builder, env, off, size);
     let src_value = load_reg(builder, cpu, JitDirectReg::Data(src));
@@ -10457,7 +10701,7 @@ fn emit_indirect_jsr(
     };
     let old_sp = load_reg(builder, cpu, JitDirectReg::Addr(7));
     let new_sp = builder.ins().iadd_imm(old_sp, -4);
-    let (off, _) = checked_window_off(builder, env, bail, new_sp, Size::Long);
+    let (off, _) = checked_window_off(builder, env, bail, new_sp, Size::Long, true);
     let return_pc = iconst_u32(builder, trace.pc.wrapping_add(trace.length() as u32));
     window_store(builder, env, off, Size::Long, return_pc);
 
@@ -10497,7 +10741,7 @@ fn emit_call_through(
     });
     let old_sp = load_reg(builder, cpu, JitDirectReg::Addr(7));
     let new_sp = builder.ins().iadd_imm(old_sp, -4);
-    let (off, masked) = checked_window_off(builder, env, bail, new_sp, Size::Long);
+    let (off, masked) = checked_window_off(builder, env, bail, new_sp, Size::Long, true);
     guard_store_not_code(builder, env, bail, masked, Size::Long);
     let value = iconst_u32(builder, return_pc);
     window_store(builder, env, off, Size::Long, value);
@@ -10531,7 +10775,7 @@ fn emit_rts_return(
         at,
     });
     let sp = load_reg(builder, cpu, JitDirectReg::Addr(7));
-    let (off, _) = checked_window_off(builder, env, bail, sp, Size::Long);
+    let (off, _) = checked_window_off(builder, env, bail, sp, Size::Long, false);
     let popped = window_load(builder, env, off, Size::Long);
     let mismatch = builder
         .ins()
@@ -10571,7 +10815,7 @@ fn emit_return_exit(
         at,
     });
     let sp = load_reg(builder, cpu, JitDirectReg::Addr(7));
-    let (off, _) = checked_window_off(builder, env, bail, sp, Size::Long);
+    let (off, _) = checked_window_off(builder, env, bail, sp, Size::Long, false);
     let target = window_load(builder, env, off, Size::Long);
     let new_sp = builder.ins().iadd_imm(sp, 4 + i64::from(displacement));
     store_reg(builder, cpu, JitDirectReg::Addr(7), new_sp);
@@ -10604,10 +10848,7 @@ fn execute_portable_call_through(
         return None;
     }
     let masked = new_sp & cpu.address_mask;
-    let off = masked.wrapping_sub(cpu.fm_base);
-    if off > cpu.fm_len - 4 {
-        return None;
-    }
+    let off = cpu.window_off(masked, 4, true, false)?;
     if spans.store_hits_code(masked, 4) {
         return None;
     }
@@ -10646,10 +10887,7 @@ fn execute_portable_return_exit(cpu: &mut CpuCore, trace: TraceBuildOp) -> Optio
     if cpu.is_pre_68020 && (sp & 1) != 0 {
         return None;
     }
-    let off = (sp & cpu.address_mask).wrapping_sub(cpu.fm_base);
-    if off > cpu.fm_len - 4 {
-        return None;
-    }
+    let off = cpu.window_off(sp & cpu.address_mask, 4, false, false)?;
     let target = unsafe {
         let p = (cpu.fm_ptr as *const u8).add(off as usize);
         u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
@@ -10673,10 +10911,7 @@ fn execute_portable_rts_return(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option
     if cpu.is_pre_68020 && (sp & 1) != 0 {
         return None;
     }
-    let off = (sp & cpu.address_mask).wrapping_sub(cpu.fm_base);
-    if off > cpu.fm_len - 4 {
-        return None;
-    }
+    let off = cpu.window_off(sp & cpu.address_mask, 4, false, false)?;
     let popped = unsafe {
         let p = (cpu.fm_ptr as *const u8).add(off as usize);
         u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
@@ -10723,7 +10958,7 @@ fn emit_mem_addq_subq(
     });
     let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
     let addr = builder.ins().iadd_imm(base, displacement as i64);
-    let (off, masked) = checked_window_off(builder, env, bail, addr, size);
+    let (off, masked) = checked_window_off(builder, env, bail, addr, size, true);
     let value = window_load(builder, env, off, size);
     guard_store_not_code(builder, env, bail, masked, size);
 
@@ -10774,7 +11009,17 @@ fn emit_an_disp_mem(
     };
     let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
     let addr = builder.ins().iadd_imm(base, displacement as i64);
-    let (off, masked) = checked_window_off(builder, env, bail, addr, size);
+    let writes = !matches!(
+        trace.op,
+        JitTraceOp::AnDispUnary {
+            op: JitUnaryOp::Tst,
+            ..
+        } | JitTraceOp::AnDispBit {
+            op: JitBitOp::Test,
+            ..
+        }
+    );
+    let (off, masked) = checked_window_off(builder, env, bail, addr, size, writes);
     let value = window_load(builder, env, off, size);
 
     match trace.op {
@@ -10877,7 +11122,7 @@ fn emit_pea_disp(
         _ => unreachable!("expected a PEA trace"),
     };
     let new_sp = builder.ins().iadd_imm(sp, -4);
-    let (off, masked) = checked_window_off(builder, env, bail, new_sp, Size::Long);
+    let (off, masked) = checked_window_off(builder, env, bail, new_sp, Size::Long, true);
     guard_store_not_code(builder, env, bail, masked, Size::Long);
     window_store(builder, env, off, Size::Long, address);
     store_reg(builder, cpu, JitDirectReg::Addr(7), new_sp);
@@ -10909,7 +11154,7 @@ fn emit_link(
     let an = load_reg(builder, cpu, JitDirectReg::Addr(reg));
     let sp = load_reg(builder, cpu, JitDirectReg::Addr(7));
     let new_sp = builder.ins().iadd_imm(sp, -4);
-    let (off, masked) = checked_window_off(builder, env, bail, new_sp, Size::Long);
+    let (off, masked) = checked_window_off(builder, env, bail, new_sp, Size::Long, true);
     guard_store_not_code(builder, env, bail, masked, Size::Long);
     window_store(builder, env, off, Size::Long, an);
     store_reg(builder, cpu, JitDirectReg::Addr(reg), new_sp);
@@ -10940,7 +11185,7 @@ fn emit_unlk(
     });
 
     let addr = load_reg(builder, cpu, JitDirectReg::Addr(reg));
-    let (off, _) = checked_window_off(builder, env, bail, addr, Size::Long);
+    let (off, _) = checked_window_off(builder, env, bail, addr, Size::Long, false);
     let value = window_load(builder, env, off, Size::Long);
     let new_sp = builder.ins().iadd_imm(addr, 4);
     store_reg(builder, cpu, JitDirectReg::Addr(7), new_sp);
@@ -11056,19 +11301,19 @@ fn emit_move_mem(
         }
         JitEa::Ind(r) => {
             let a = load_an(builder, r);
-            let (off, _) = checked_window_off(builder, env, bail, a, size);
+            let (off, _) = checked_window_off(builder, env, bail, a, size, false);
             source_address = Some(builder.ins().iadd(env.fm_base, off));
             window_load(builder, env, off, size)
         }
         JitEa::PcDisp(address) | JitEa::AbsWord(address) | JitEa::AbsLong(address) => {
             let address = iconst_u32(builder, address);
-            let (off, _) = checked_window_off(builder, env, bail, address, size);
+            let (off, _) = checked_window_off(builder, env, bail, address, size, false);
             source_address = Some(builder.ins().iadd(env.fm_base, off));
             window_load(builder, env, off, size)
         }
         JitEa::PostInc(r) => {
             let a = load_an(builder, r);
-            let (off, _) = checked_window_off(builder, env, bail, a, size);
+            let (off, _) = checked_window_off(builder, env, bail, a, size, false);
             let next = builder.ins().iadd_imm(a, jit_ea_step(size, r) as i64);
             staged = Some((r, next));
             source_address = Some(builder.ins().iadd(env.fm_base, off));
@@ -11077,7 +11322,7 @@ fn emit_move_mem(
         JitEa::PreDec(r) => {
             let a0 = load_an(builder, r);
             let a = builder.ins().iadd_imm(a0, -(jit_ea_step(size, r) as i64));
-            let (off, _) = checked_window_off(builder, env, bail, a, size);
+            let (off, _) = checked_window_off(builder, env, bail, a, size, false);
             staged = Some((r, a));
             source_address = Some(builder.ins().iadd(env.fm_base, off));
             window_load(builder, env, off, size)
@@ -11085,7 +11330,7 @@ fn emit_move_mem(
         JitEa::Disp(r, displacement) => {
             let base = load_an(builder, r);
             let a = builder.ins().iadd_imm(base, displacement as i64);
-            let (off, _) = checked_window_off(builder, env, bail, a, size);
+            let (off, _) = checked_window_off(builder, env, bail, a, size, false);
             source_address = Some(builder.ins().iadd(env.fm_base, off));
             window_load(builder, env, off, size)
         }
@@ -11111,7 +11356,7 @@ fn emit_move_mem(
             };
             let a = builder.ins().iadd(base, index);
             let a = builder.ins().iadd_imm(a, displacement as i64);
-            let (off, _) = checked_window_off(builder, env, bail, a, size);
+            let (off, _) = checked_window_off(builder, env, bail, a, size, false);
             source_address = Some(builder.ins().iadd(env.fm_base, off));
             window_load(builder, env, off, size)
         }
@@ -11137,7 +11382,7 @@ fn emit_move_mem(
                 builder.ins().ishl_imm(index, i64::from(scale))
             };
             let a = builder.ins().iadd(base, index);
-            let (off, _) = checked_window_off(builder, env, bail, a, size);
+            let (off, _) = checked_window_off(builder, env, bail, a, size, false);
             source_address = Some(builder.ins().iadd(env.fm_base, off));
             window_load(builder, env, off, size)
         }
@@ -11193,7 +11438,7 @@ fn emit_move_mem(
                 }
                 _ => unreachable!(),
             };
-            let (off, masked) = checked_window_off(builder, env, bail, addr, size);
+            let (off, masked) = checked_window_off(builder, env, bail, addr, size, true);
 
             // Self-modification guard: a store overlapping this trace's
             // own code bails (before committing) so the interpreter
@@ -11235,7 +11480,7 @@ fn emit_move_mem(
             };
             let a = builder.ins().iadd(base_value, index_value);
             let addr = builder.ins().iadd_imm(a, displacement as i64);
-            let (off, masked) = checked_window_off(builder, env, bail, addr, size);
+            let (off, masked) = checked_window_off(builder, env, bail, addr, size, true);
             guard_store_not_code(builder, env, bail, masked, size);
             commit_staged(builder);
             window_store_with_copy(builder, env, off, size, value, source_address);
@@ -11243,7 +11488,7 @@ fn emit_move_mem(
         }
         JitEa::AbsWord(address) | JitEa::AbsLong(address) => {
             let address = iconst_u32(builder, address);
-            let (off, masked) = checked_window_off(builder, env, bail, address, size);
+            let (off, masked) = checked_window_off(builder, env, bail, address, size, true);
             guard_store_not_code(builder, env, bail, masked, size);
             commit_staged(builder);
             window_store_with_copy(builder, env, off, size, value, source_address);
@@ -25525,3 +25770,110 @@ mod durable_rejection_tests {
 
 #[cfg(test)]
 mod flow_latch_tests;
+
+#[cfg(test)]
+mod translated_window_tests {
+    //! Traces recorded and run through a translated fastmem window: the
+    //! recorder decodes the code at its translated frame, the trace compiles
+    //! for translated execution, and switching the PMMU re-records it.
+
+    use super::*;
+    use crate::LinearMemoryBus;
+
+    const TABLE: u32 = 0x1_0000;
+    const CODE: u32 = 0x8000;
+    const CODE_FRAME: u32 = 0x2_8000;
+    const DATA: u32 = 0x5000;
+    const DATA_FRAME: u32 = 0x2_1000;
+    /// `loop: ADD.L D0,(A0) ; ADDQ.L #1,D0 ; DBRA D7,loop ; A-line`.
+    const LOOP: [u16; 5] = [0xD190, 0x5280, 0x51CF, 0xFFFA, 0xA000];
+
+    fn write_words(bus: &mut LinearMemoryBus, at: u32, words: &[u16]) {
+        for (i, word) in words.iter().enumerate() {
+            bus.write_word_at(at + 2 * i as u32, *word);
+        }
+    }
+
+    /// A 68030 with one level of 4 KB short page descriptors, identity
+    /// apart from CODE and DATA, which map to frames elsewhere. The CODE
+    /// alias at its own physical address holds NOPs, never the loop.
+    fn machine() -> (CpuCore, LinearMemoryBus) {
+        let mut bus = LinearMemoryBus::new(0x4_0000);
+        for page in 0..0x40u32 {
+            bus.write_long_at(TABLE + page * 4, (page << 12) | 1);
+        }
+        bus.write_long_at(TABLE + (CODE >> 12) * 4, CODE_FRAME | 1);
+        bus.write_long_at(TABLE + (DATA >> 12) * 4, DATA_FRAME | 1);
+        write_words(&mut bus, CODE_FRAME, &LOOP);
+        write_words(&mut bus, CODE, &[0x4E71; 5]);
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68030);
+        cpu.set_sr(0x2700);
+        cpu.set_a(7, 0x7F00);
+        cpu.mmu_crp_aptr = TABLE;
+        cpu.mmu_crp_limit = 2;
+        cpu.mmu_tc = 0x80C8_C000;
+        cpu.pmmu_enabled = true;
+        cpu.set_a(0, DATA);
+        cpu.set_d(7, 9_999);
+        cpu.pc = CODE;
+        (cpu, bus)
+    }
+
+    fn run(cpu: &mut CpuCore, bus: &mut LinearMemoryBus) {
+        for _ in 0..1_000 {
+            match cpu.run_batch(bus, 4096, &[]).exit {
+                crate::BatchExit::BudgetExhausted => {}
+                crate::BatchExit::AlineTrap { opcode: 0xA000 } => return,
+                other => panic!("unexpected exit {other:?}"),
+            }
+        }
+        panic!("loop did not finish");
+    }
+
+    /// The compiled trace at `pc`: whether it translates, and its opcodes.
+    fn compiled(pc: u32) -> Option<(bool, Vec<u16>)> {
+        with_trace_jit(|jit| match &jit.slots[trace_cache_index(pc)] {
+            TraceSlot::Compiled(trace) if trace.pc == pc => Some((
+                trace.translated,
+                trace.ops.iter().map(|op| op.opcode).collect(),
+            )),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn trace_records_the_translated_frame_and_runs_translated() {
+        let (mut cpu, mut bus) = machine();
+        run(&mut cpu, &mut bus);
+        let (translated, opcodes) = compiled(CODE).expect("the loop compiles");
+        assert!(translated, "compiled for translated execution");
+        assert_eq!(
+            opcodes,
+            [0xD190, 0x5280, 0x51CF],
+            "the frame's code, not the alias"
+        );
+        assert_eq!(bus.read_long(DATA_FRAME), (0..10_000u32).sum::<u32>());
+        assert_eq!(bus.read_long(DATA), 0, "nothing reached the identity alias");
+    }
+
+    #[test]
+    fn switching_the_pmmu_rerecords_the_trace() {
+        let (mut cpu, mut bus) = machine();
+        run(&mut cpu, &mut bus);
+        assert_eq!(compiled(CODE).map(|(translated, _)| translated), Some(true));
+
+        // Untranslated, CODE is its own physical address: put the loop
+        // there too, and run it on the data alias.
+        write_words(&mut bus, CODE, &LOOP);
+        cpu.pmmu_enabled = false;
+        cpu.pc = CODE;
+        cpu.set_d(0, 0);
+        cpu.set_d(7, 9_999);
+        run(&mut cpu, &mut bus);
+        let (translated, opcodes) = compiled(CODE).expect("re-recorded");
+        assert!(!translated, "re-recorded for physical addresses");
+        assert_eq!(opcodes, [0xD190, 0x5280, 0x51CF]);
+        assert_eq!(bus.read_long(DATA), (0..10_000u32).sum::<u32>());
+    }
+}

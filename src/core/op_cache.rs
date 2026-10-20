@@ -1022,6 +1022,51 @@ impl CpuCore {
         retired: &mut u32,
         probe_on_entry: bool,
     ) -> BatchInnerExit {
+        // Only a fully dispatched instruction, outside this loop, switches
+        // the window between physical and translated, so the loop is
+        // specialized for the mode it starts in; the physical one compiles
+        // as it did before translation existed.
+        if self.fm_mmu.enabled() {
+            return self.run_translated_simple_batch(
+                bus,
+                budget,
+                watch_pcs,
+                retired,
+                probe_on_entry,
+            );
+        }
+        self.run_decoded_simple_batch_in::<B, false>(
+            bus,
+            budget,
+            watch_pcs,
+            retired,
+            probe_on_entry,
+        )
+    }
+
+    #[inline(never)]
+    fn run_translated_simple_batch<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        watch_pcs: &[u32],
+        retired: &mut u32,
+        probe_on_entry: bool,
+    ) -> BatchInnerExit {
+        // Whatever ran since the last decoded run may have changed the ATC.
+        self.forget_code_page();
+        self.run_decoded_simple_batch_in::<B, true>(bus, budget, watch_pcs, retired, probe_on_entry)
+    }
+
+    #[inline]
+    fn run_decoded_simple_batch_in<B: AddressBus, const TRANSLATED: bool>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        watch_pcs: &[u32],
+        retired: &mut u32,
+        probe_on_entry: bool,
+    ) -> BatchInnerExit {
         let cpu_type = self.cpu_type;
         let watch = !watch_pcs.is_empty();
         let mut remaining = budget;
@@ -1079,10 +1124,17 @@ impl CpuCore {
             self.ppc = self.pc;
             let opcode = if self.fm_len != 0 && (self.pc & 1) == 0 {
                 // Fetch through the fastmem window: one bounds check
-                // instead of a bus call. Odd/out-of-window PCs take the
-                // normal fetch path (and its address-error handling).
-                let off = self.address(self.pc).wrapping_sub(self.fm_base);
-                if off <= self.fm_len - 2 {
+                // instead of a bus call. Odd/out-of-window PCs, and PCs the
+                // PMMU cannot translate without a table search, take the
+                // normal fetch path (and its fault handling).
+                let addr = self.address(self.pc);
+                let off = if TRANSLATED {
+                    self.code_window_off(addr)
+                } else {
+                    let off = addr.wrapping_sub(self.fm_base);
+                    (off <= self.fm_len - 2).then_some(off)
+                };
+                if let Some(off) = off {
                     let opcode = unsafe {
                         let p = (self.fm_ptr as *const u8).add(off as usize);
                         u16::from_be_bytes([*p, *p.add(1)])
@@ -1091,6 +1143,11 @@ impl CpuCore {
                     opcode
                 } else {
                     let opcode = self.read_opcode_16(bus);
+                    if TRANSLATED {
+                        // A table search may have replaced the remembered
+                        // page.
+                        self.forget_code_page();
+                    }
                     if self.run_mode == RUN_MODE_BERR_AERR_RESET {
                         return BatchInnerExit::Fault;
                     }
@@ -1282,7 +1339,9 @@ fn read_direct_reg(cpu: &CpuCore, reg: DirectReg, size: Size) -> u32 {
     }
 }
 
-#[inline]
+/// Always inlined, like `read_direct_reg`: three operations on the hottest
+/// decoded path.
+#[inline(always)]
 fn write_data_reg(cpu: &mut CpuCore, reg: usize, size: Size, value: u32) {
     let mask = size.mask();
     cpu.dar[reg] = (cpu.dar[reg] & !mask) | (value & mask);

@@ -130,6 +130,19 @@ pub fn check_transparent_translation(
     None
 }
 
+/// Whether any register [`check_transparent_translation`] consults for this
+/// CPU is enabled; when none is, it matches nothing.
+pub(crate) fn any_transparent_translation(cpu: &CpuCore) -> bool {
+    let enabled = |ttr: u32| ttr & TTR_ENABLE != 0;
+    match cpu.cpu_type {
+        CpuType::M68030 => enabled(cpu.mmu_tt0) || enabled(cpu.mmu_tt1),
+        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 => {
+            enabled(cpu.itt0) || enabled(cpu.itt1) || enabled(cpu.dtt0) || enabled(cpu.dtt1)
+        }
+        _ => false,
+    }
+}
+
 /// Compute function code for the current access.
 ///
 /// FC is a 3-bit value:

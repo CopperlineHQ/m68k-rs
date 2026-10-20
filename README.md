@@ -318,10 +318,25 @@ as retained graphics coverage and write journals without interpreting the loop.
 
 Both capabilities are opt-in. `TrackedMem` requires stable, side-effect-free
 reads and infallible writes with the restrictions documented on the type;
-faulting, relocating, MMIO, and read-observing buses must decline it. Active MMU
-translation and pre-68020 store sequencing retain the ordinary path. A compiled
-memory trace is specialized for its write mode and re-recorded if that mode
-changes between batches, keeping notification checks out of direct stores.
+faulting, relocating, MMIO, and read-observing buses must decline it. Pre-68020
+store sequencing retains the ordinary path. A compiled memory trace is
+specialized for its write mode and re-recorded if that mode changes between
+batches, keeping notification checks out of direct stores.
+
+Either window is indexed by physical address. With the PMMU enabled, each
+access through it is translated first by the transparent-translation registers
+and the ATC alone, never a table search. An access they cannot map into the
+window -- an ATC miss, a protection violation, a physical address outside it,
+one spanning two pages -- takes the ordinary path, which searches the tables
+and raises any fault with its exact frame. While the window translates, no ATC
+hit records a use in the 68030's replacement order -- not through the window,
+a compiled trace or the ordinary path -- so entries age by when table searches
+loaded them, and the saved order does not depend on what the trace JIT
+compiled. Outside `run_batch` replacement stays least recently used.
+Memory-to-memory MOVE notifications
+are omitted under translation, as on the ordinary path. Traces are compiled
+for translated or physical addresses and re-recorded when the PMMU is switched
+between batches.
 
 ## Supported CPU Types
 
