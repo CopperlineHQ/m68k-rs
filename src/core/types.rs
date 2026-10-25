@@ -250,6 +250,8 @@ impl StepResult {
 pub enum BatchExit {
     /// The instruction budget was fully consumed with no other event.
     BudgetExhausted,
+    /// The bus requested synchronization before the next instruction.
+    BoundaryRequested,
     /// The CPU is stopped (STOP instruction executed, or it was already
     /// stopped on entry — the latter returns with `instructions == 0`).
     Stopped,

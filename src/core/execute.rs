@@ -591,6 +591,7 @@ impl CpuCore {
     ///   illegal — surfaced exactly like [`step`](Self::step), never taken
     ///   as a hardware exception),
     /// - the CPU stopping (STOP instruction),
+    /// - the bus yielding through [`AddressBus::batch_boundary`],
     /// - execution reaching a PC listed in `watch_pcs`, or
     /// - the instruction budget running out.
     ///
@@ -742,6 +743,13 @@ impl CpuCore {
         }
 
         loop {
+            if bus.batch_boundary(retired, self.pc, self.get_sr()) {
+                trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
+                return BatchResult {
+                    instructions: retired,
+                    exit: BatchExit::BoundaryRequested,
+                };
+            }
             // The trace JIT's headroom guard compares against
             // `cycles_remaining`; keep it topped up so it can never gate a
             // trace in this instruction-budgeted mode (traces decrement it
@@ -768,6 +776,12 @@ impl CpuCore {
                     &mut retired,
                     probe_on_entry,
                 ) {
+                    BatchInnerExit::Boundary => {
+                        return BatchResult {
+                            instructions: retired,
+                            exit: BatchExit::BoundaryRequested,
+                        };
+                    }
                     BatchInnerExit::Budget => {
                         return BatchResult {
                             instructions: retired,
@@ -812,6 +826,14 @@ impl CpuCore {
                 opcode
             };
 
+            if bus.batch_boundary(retired, self.ppc, self.get_sr()) {
+                self.pc = self.ppc;
+                trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
+                return BatchResult {
+                    instructions: retired,
+                    exit: BatchExit::BoundaryRequested,
+                };
+            }
             if self.ir != opcode as u32 {
                 self.ir = opcode as u32;
             }
@@ -1529,5 +1551,146 @@ mod tests {
                 assert!(decode_boundary_hook_op(cpu_type, opcode).is_none());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_host_boundary_tests {
+    use crate::{AddressBus, BatchExit, CpuCore, CpuType, FastMem};
+
+    struct Bus {
+        ram: Vec<u8>,
+        synced: u32,
+        stop_at: u32,
+        writes: Vec<(u32, u16)>,
+        direct: bool,
+        stop_on_fetch: Option<u32>,
+        fetched_boundary: bool,
+    }
+    impl Bus {
+        fn new() -> Self {
+            let mut ram = vec![0; 4096];
+            // D0 = 0; D1 = 63; increment D0 64 times; write MMIO; repeat.
+            let words = [
+                0x7000u16, 0x723f, 0x5280, 0x51c9, 0xfffc, 0x33c0, 0x00df, 0xf180, 0x60ee,
+            ];
+            for (i, word) in words.iter().enumerate() {
+                ram[0x100 + i * 2..0x102 + i * 2].copy_from_slice(&word.to_be_bytes());
+            }
+            Self {
+                ram,
+                synced: 0,
+                stop_at: u32::MAX,
+                writes: Vec::new(),
+                direct: true,
+                stop_on_fetch: None,
+                fetched_boundary: false,
+            }
+        }
+    }
+    impl AddressBus for Bus {
+        fn read_byte(&mut self, a: u32) -> u8 {
+            self.ram[a as usize]
+        }
+        fn read_word(&mut self, a: u32) -> u16 {
+            self.fetched_boundary |= self.stop_on_fetch == Some(a);
+            u16::from_be_bytes(self.ram[a as usize..a as usize + 2].try_into().unwrap())
+        }
+        fn read_long(&mut self, a: u32) -> u32 {
+            u32::from_be_bytes(self.ram[a as usize..a as usize + 4].try_into().unwrap())
+        }
+        fn write_byte(&mut self, a: u32, v: u8) {
+            self.ram[a as usize] = v;
+        }
+        fn write_word(&mut self, a: u32, v: u16) {
+            if a == 0xdff180 {
+                self.writes.push((self.synced, v));
+            } else {
+                self.ram[a as usize..a as usize + 2].copy_from_slice(&v.to_be_bytes());
+            }
+        }
+        fn write_long(&mut self, a: u32, v: u32) {
+            self.ram[a as usize..a as usize + 4].copy_from_slice(&v.to_be_bytes());
+        }
+        fn fast_mem(&mut self) -> Option<FastMem> {
+            self.direct.then_some(FastMem {
+                ptr: self.ram.as_mut_ptr(),
+                base: 0,
+                len: self.ram.len() as u32,
+            })
+        }
+        fn batch_boundary(&mut self, retired: u32, _pc: u32, _sr: u16) -> bool {
+            self.synced = retired;
+            self.fetched_boundary || retired >= self.stop_at
+        }
+    }
+    fn cpu() -> CpuCore {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.pc = 0x100;
+        cpu
+    }
+
+    #[test]
+    fn host_sees_native_prefix_before_device_write() {
+        let mut bus = Bus::new();
+        #[cfg(feature = "trace-profile")]
+        crate::core::trace_profile::reset();
+        let result = cpu().run_batch(&mut bus, 132 * 100, &[]);
+        #[cfg(feature = "trace-profile")]
+        assert!(
+            crate::core::trace_profile::snapshot()
+                .rows
+                .iter()
+                .any(|row| row.native_calls > 0)
+        );
+        assert_eq!(result.instructions, 132 * 100);
+        assert_eq!(bus.writes.len(), 100);
+        for (retired, value) in bus.writes {
+            assert_eq!(
+                retired % 132,
+                130,
+                "complete native prefix before bus write"
+            );
+            assert_eq!(value, 64);
+        }
+    }
+
+    #[test]
+    fn requested_host_boundary_resumes_without_replaying_an_instruction() {
+        let mut bus = Bus::new();
+        let mut split = cpu();
+        bus.stop_at = 132;
+        let first = split.run_batch(&mut bus, 10_000, &[]);
+        assert_eq!(first.exit, BatchExit::BoundaryRequested);
+        assert_eq!(first.instructions, 132);
+        bus.stop_at = u32::MAX;
+        let second = split.run_batch(&mut bus, 132, &[]);
+        assert_eq!(second.instructions, 132);
+        let mut whole = cpu();
+        whole.run_batch(&mut Bus::new(), 264, &[]);
+        assert_eq!(split.pc, whole.pc);
+        assert_eq!(split.d(0), whole.d(0));
+        assert_eq!(split.d(1), whole.d(1));
+        assert_eq!(split.get_sr(), whole.get_sr());
+    }
+
+    #[test]
+    fn boundary_raised_by_opcode_fetch_yields_before_dispatch() {
+        let mut bus = Bus::new();
+        bus.direct = false;
+        bus.stop_on_fetch = Some(0x10a); // MOVE.W D0,MMIO
+        let mut cpu = cpu();
+        let result = cpu.run_batch(&mut bus, 1000, &[]);
+        assert_eq!(result.exit, BatchExit::BoundaryRequested);
+        assert_eq!(result.instructions, 130);
+        assert_eq!(cpu.pc, 0x10a);
+        assert!(bus.writes.is_empty());
+        bus.stop_on_fetch = None;
+        bus.fetched_boundary = false;
+        let result = cpu.run_batch(&mut bus, 1, &[]);
+        assert_eq!(result.instructions, 1);
+        assert_eq!(cpu.pc, 0x110);
+        assert_eq!(bus.writes, [(0, 64)]);
     }
 }
