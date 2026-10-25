@@ -634,8 +634,13 @@ impl CpuCore {
             self.trace_record_skip = [super::trace_jit::TRACE_PC_NONE; 4];
             self.trace_probe_skip = [super::trace_jit::TRACE_PC_NONE; 4];
         }
-        for region in bus.fast_mem_regions().into_iter().flatten() {
-            self.capture_extra_window(region);
+        let regions = bus.fast_mem_regions();
+        // Keep the default empty table cheap even when the full capture loop
+        // is too large for the optimizer to unroll and eliminate.
+        if regions.iter().any(Option::is_some) {
+            for region in regions.into_iter().flatten() {
+                self.capture_extra_window(region);
+            }
         }
         #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         // The pre-020 interpreter splits some long stores into ordered word
