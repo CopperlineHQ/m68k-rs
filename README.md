@@ -308,6 +308,22 @@ throughput matter more than observing the physical prefetch bus.
 
 ### Direct RAM and observed writes
 
+`AddressBus::fast_mem_regions()` optionally supplies up to eight additional
+physical memory regions (`FastMemRegion { ptr, base, len, writable }`). Use a
+read-only region for ROM: instruction fetches and reads can stay direct, while
+stores and read-modify-write instructions fall back atomically to the bus.
+Each region must describe stable, side-effect-free backing memory, with no
+overlap in guest addresses or host allocations (including the CPU itself).
+Regions shorter than four bytes, wrapping guest ranges, and guest overlaps are
+ignored. A watchpoint or observer must withhold the affected regions.
+
+The original writable `FastMem` window is checked first. Native traces compiled
+with only that window retain their original per-access code; changing between
+single-window and multi-window modes re-records affected traces. With an enabled
+PMMU, resident translation and its permissions are checked before the physical
+region lookup; misses and page crossings use ordinary instruction dispatch.
+The mapping is captured anew for each batch and is not serialized.
+
 `run_batch()` prefers `AddressBus::fast_mem()`, whose `FastMem` window permits
 side-effect-free direct reads and writes. With native JIT enabled on 68020 and
 later CPUs, a bus that needs write bookkeeping can instead return `TrackedMem`
