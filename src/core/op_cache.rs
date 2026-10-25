@@ -180,6 +180,8 @@ pub(crate) enum CachedRunResult {
 
 /// Result of the instruction-budgeted fast loop used by `run_batch`.
 pub(crate) enum BatchInnerExit {
+    /// The embedder requested synchronization before the next instruction.
+    Boundary,
     /// The remaining instruction budget hit zero.
     Budget,
     /// Execution reached a PC in the caller's watch list.
@@ -1083,6 +1085,10 @@ impl CpuCore {
         let mut probe = probe_on_entry && trace_jit::has_trace_candidates();
 
         while remaining > 0 {
+            if bus.batch_boundary(*retired, self.pc, self.get_sr()) {
+                trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
+                return BatchInnerExit::Boundary;
+            }
             if probe && remaining >= trace_jit::TRACE_MIN_OPS as u32 {
                 // run_batch is instruction-budgeted, not cycle-budgeted.
                 // A long-running self-loop can consume the synthetic cycle

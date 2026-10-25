@@ -212,7 +212,15 @@ fn emulate(cpu: &mut CpuCore, bus: &mut impl AddressBus) {
 | **`run_for_cycles()`** | CPU cycles | Precise path with actual cycle and instruction totals | Surfaces traps, STOP, and bus-requested instruction boundaries separately |
 | **`run_for_cycles_with_hook()`** | CPU cycles | Same precise path, with host synchronization after each normally completed instruction | The hook can continue or request an instruction-boundary return |
 | **`run_for_cycles_with_boundary_hook()`** | CPU cycles | Same precise path, with separate instruction and interrupt-entry events | The hook can synchronize or return before the first handler instruction |
-| **`run_batch()`** | Instructions | Throughput path using decoded-op caching, optional direct RAM, and portable or `jit`-enabled native hot-loop traces | Surfaces traps, STOP, watched PCs, or budget exhaustion |
+| **`run_batch()`** | Instructions | Throughput path using decoded-op caching, optional direct RAM, and portable or `jit`-enabled native hot-loop traces | Surfaces traps, STOP, watched PCs, host boundaries, or budget exhaustion |
+
+An instruction-budgeted host can implement `AddressBus::batch_boundary` to
+synchronize peripherals before an interpreted device access following a native
+trace. The callback receives the cumulative retired count, next PC and SR, and
+can return `true` to yield with `BatchExit::BoundaryRequested`. Native traces
+can retire the entire remaining budget between callbacks; choose a budget that
+respects the next device deadline and account for the final `BatchResult` count
+on return. The default callback adds no work for buses that do not need it.
 
 Use **`step()`** for debugger-style control. Use **`run_for_cycles()`** when a
 machine scheduler needs to advance the CPU by a clock budget without losing

@@ -285,6 +285,31 @@ pub trait AddressBus {
         self.last_fetch_was_cached()
     }
 
+    /// Synchronize the embedder during [`CpuCore::run_batch`](super::cpu::CpuCore::run_batch).
+    ///
+    /// `retired` is the cumulative instruction count in this batch; `pc` and
+    /// `sr` describe the next instruction boundary. Calls may repeat the same
+    /// count. Native traces can retire many instructions between calls, up to
+    /// the caller's remaining budget: this is not a per-instruction hook or a
+    /// way to interrupt a running native trace. Bound the batch budget when a
+    /// device deadline must not be crossed.
+    ///
+    /// The hook runs before ordinary instruction dispatch, including after a
+    /// native prefix exits to a bus access. Return `true` to yield with
+    /// [`BatchExit::BoundaryRequested`](crate::BatchExit::BoundaryRequested);
+    /// completed work is retained and the next instruction has not executed.
+    /// An opcode fetch can already have occurred. Account for any final work
+    /// from `BatchResult::instructions` on return, since there need not be a
+    /// final hook call when a budget, trap, or watched PC ends the batch.
+    ///
+    /// Do not relocate or resize an exposed memory window from this hook.
+    /// Return to the caller before changing the window's address range or
+    /// permissions. The default is a no-op, compiled away for functional buses.
+    #[inline]
+    fn batch_boundary(&mut self, _retired: u32, _pc: u32, _sr: u16) -> bool {
+        false
+    }
+
     /// Take a pending request to return from cycle-scheduled execution at
     /// the next completed instruction or interrupt-entry boundary.
     ///
