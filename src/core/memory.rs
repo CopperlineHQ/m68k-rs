@@ -462,7 +462,8 @@ pub trait AddressBus {
     }
 
     /// Optionally expose read-direct RAM with intercepted writes. Native traces
-    /// use this only when `fast_mem` is unavailable. Interpreter memory stores
+    /// use this only when neither `fast_mem` nor `fast_mem_regions` supplies
+    /// a valid direct region. Interpreter memory stores
     /// and compiled stores both retain bus write and MOVE metadata notifications.
     /// See [`TrackedMem`] for the required, stronger-than-ordinary-bus contract.
     fn tracked_mem(&mut self) -> Option<TrackedMem> {
