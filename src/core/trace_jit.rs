@@ -3984,10 +3984,12 @@ impl TraceJit {
                 pointer_sig.params.push(AbiParam::new(types::I32));
                 pointer_sig.returns.push(AbiParam::new(ptr_ty));
                 let pointer_sig = builder.import_signature(pointer_sig);
-                let pointer_fn = builder.ins().iconst(
-                    ptr_ty,
-                    crate::core::window::trace_window_ptr as *const () as usize as i64,
-                );
+                let pointer_fn = multi_window.then(|| {
+                    builder.ins().iconst(
+                        ptr_ty,
+                        crate::core::window::trace_window_ptr as *const () as usize as i64,
+                    )
+                });
                 Some(MemEnv {
                     fm_readonly,
                     resolved_ptrs: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -9612,7 +9614,7 @@ struct MemEnv {
     fm_readonly: Option<Value>,
     resolved_ptrs: std::cell::RefCell<std::collections::HashMap<Value, Value>>,
     pointer_sig: cranelift_codegen::ir::SigRef,
-    pointer_fn: Value,
+    pointer_fn: Option<Value>,
     address_mask: u32,
     aligned_only: bool,
     code_start: u32,
@@ -9877,9 +9879,11 @@ fn window_host_addr(builder: &mut FunctionBuilder<'_>, env: &MemEnv, off: Value)
     let ptr = builder.ins().iadd(env.fm_ptr, off_ptr);
     builder.ins().jump(join, &[ptr.into()]);
     builder.switch_to_block(extra);
-    let call = builder
-        .ins()
-        .call_indirect(env.pointer_sig, env.pointer_fn, &[env.cpu, off]);
+    let call = builder.ins().call_indirect(
+        env.pointer_sig,
+        env.pointer_fn.expect("multi-window pointer"),
+        &[env.cpu, off],
+    );
     let ptr = builder.inst_results(call)[0];
     builder.ins().jump(join, &[ptr.into()]);
     builder.switch_to_block(join);
