@@ -322,8 +322,8 @@ read-only region for ROM: instruction fetches and reads can stay direct, while
 stores and read-modify-write instructions fall back atomically to the bus.
 Each region must describe stable, side-effect-free backing memory, with no
 overlap in guest addresses or host allocations (including the CPU itself).
-Regions shorter than four bytes, wrapping guest ranges, and guest overlaps are
-ignored. A watchpoint or observer must withhold the affected regions.
+Regions shorter than four bytes, wrapping guest ranges, and overlapping ranges
+are ignored. A watchpoint or observer must withhold the affected regions.
 
 The original writable `FastMem` window is checked first. Native traces compiled
 with only that window retain their original per-access code; changing between
@@ -332,8 +332,10 @@ PMMU, resident translation and its permissions are checked before the physical
 region lookup; misses and page crossings use ordinary instruction dispatch.
 The mapping is captured anew for each batch and is not serialized.
 
-`run_batch()` prefers `AddressBus::fast_mem()`, whose `FastMem` window permits
-side-effect-free direct reads and writes. With native JIT enabled on 68020 and
+`run_batch()` prefers `AddressBus::fast_mem()` and `fast_mem_regions()`. If the
+primary window is absent, the first valid extra region becomes primary.
+`TrackedMem` is used only when neither method supplies a valid region.
+`FastMem` permits side-effect-free direct reads and writes. With native JIT enabled on 68020 and
 later CPUs, a bus that needs write bookkeeping can instead return `TrackedMem`
 from `AddressBus::tracked_mem()`. Compiled code reads RAM directly and calls
 `write_byte/word/long` for stores; memory-to-memory MOVE also retains
