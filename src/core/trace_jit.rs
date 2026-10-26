@@ -1389,18 +1389,20 @@ fn validate_trace_code<B: AddressBus>(
 ) -> SlowTraceCodeValidation {
     let unchanged = if cpu.fm_mmu.enabled() {
         translated_code_segments_eq(cpu, &trace.code, &trace.code_segments)
-    } else if cpu.fm_region_count != 0 || cpu.fm_readonly {
-        // Code can live in an extra region; resolve every segment there.
-        code_regions_equal(cpu, &trace.code, &trace.code_segments)
     } else {
-        cpu.fm_len != 0
+        // Code usually lives in the primary window: keep its specialized
+        // comparison first, and resolve segments in extra regions (ROM, other
+        // banks) only when that misses.
+        (cpu.fm_len != 0
             && trace_code_segments_eq(
                 cpu.fm_ptr,
                 cpu.fm_base,
                 cpu.fm_len,
                 &trace.code,
                 &trace.code_segments,
-            )
+            ))
+            || ((cpu.fm_region_count != 0 || cpu.fm_readonly)
+                && code_regions_equal(cpu, &trace.code, &trace.code_segments))
     };
     if unchanged {
         SlowTraceCodeValidation::Valid
