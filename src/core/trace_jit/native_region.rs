@@ -106,6 +106,7 @@ struct Head {
     needs_window: bool,
     tracked_writes: bool,
     multi_window: bool,
+    primary_readonly: bool,
     checked: usize,
     body: usize,
 }
@@ -248,6 +249,7 @@ fn snapshot(trace: &CompiledTrace) -> Result<Head, &'static str> {
         needs_window: trace.needs_window,
         tracked_writes: trace.tracked_writes,
         multi_window: trace.multi_window,
+        primary_readonly: trace.primary_readonly,
         checked: pointer(checked),
         body: pointer(trace.func),
     })
@@ -1208,6 +1210,12 @@ fn compile_snapshot(
                         .ins()
                         .icmp_imm(IntCC::NotEqual, multi, i64::from(head.multi_window));
                 decline = builder.ins().bor(decline, wrong);
+                let wrong_readonly = builder.ins().icmp_imm(
+                    IntCC::NotEqual,
+                    readonly,
+                    i64::from(head.primary_readonly),
+                );
+                decline = builder.ins().bor(decline, wrong_readonly);
             }
             builder.ins().brif(decline, resume, &[], invoke, &[]);
             builder.switch_to_block(invoke);

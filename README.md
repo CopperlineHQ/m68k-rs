@@ -328,8 +328,11 @@ Regions shorter than four bytes, wrapping guest ranges, and overlapping ranges
 are ignored. A watchpoint or observer must withhold the affected regions.
 
 The original writable `FastMem` window is checked first. Native traces compiled
-with only that window retain their original per-access code; changing between
-single-window and multi-window modes re-records affected traces. With an enabled
+with only that window retain their original per-access code. With extra regions
+the primary-window path keeps the same range check and the region search runs
+out of line; a writable primary needs no store-time permission test. Changing
+between single-window, multi-window and read-only-primary modes re-records
+affected traces. Code in any region is validated before a trace runs. With an enabled
 PMMU, resident translation and its permissions are checked before the physical
 region lookup; misses and page crossings use ordinary instruction dispatch.
 The mapping is captured anew for each batch and is not serialized.

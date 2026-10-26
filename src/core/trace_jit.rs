@@ -1227,6 +1227,81 @@ fn emit_checked_trace_wrapper(
     builder.ins().return_(&[validation_needed]);
 }
 
+/// [`emit_checked_trace_wrapper`] for a trace compiled with extra regions.
+/// Each code segment resolves through the primary window or, out of line,
+/// the region table, so code in ROM or a non-primary bank validates here.
+/// No live byte is read until its whole segment has a covering mapping.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_checked_multi_window_trace_wrapper(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    ptr_ty: Type,
+    expected_code: &[u8],
+    segments: &[TraceCodeSegment],
+    body: FuncRef,
+    body_args: &[Value],
+) {
+    let failed = builder.create_block();
+    let run = builder.create_block();
+    let fm_ptr = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        cpu,
+        offset_of!(CpuCore, fm_ptr) as i32,
+    );
+    let fm_base = load_u32(builder, cpu, offset_of!(CpuCore, fm_base));
+    let fm_len = load_u32(builder, cpu, offset_of!(CpuCore, fm_len));
+    let mut difference = builder.ins().iconst(types::I64, 0);
+    for segment in segments {
+        let start = builder.ins().iconst(types::I32, i64::from(segment.start));
+        let off = builder.ins().isub(start, fm_base);
+        let len_too_large =
+            builder
+                .ins()
+                .icmp_imm(IntCC::UnsignedLessThan, fm_len, i64::from(segment.len));
+        // This may wrap when the length is too large; `len_too_large` then
+        // sends the segment to the region table before any live load.
+        let limit = builder.ins().iadd_imm(fm_len, -i64::from(segment.len));
+        let off_too_large = builder.ins().icmp(IntCC::UnsignedGreaterThan, off, limit);
+        let outside = builder.ins().bor(len_too_large, off_too_large);
+        let off_ptr = if ptr_ty == types::I32 {
+            off
+        } else {
+            builder.ins().uextend(ptr_ty, off)
+        };
+        let primary = builder.ins().iadd(fm_ptr, off_ptr);
+        let scan = builder.create_block();
+        builder.set_cold_block(scan);
+        let compare = builder.create_block();
+        builder.append_block_param(compare, ptr_ty);
+        builder
+            .ins()
+            .brif(outside, scan, &[], compare, &[primary.into()]);
+        builder.switch_to_block(scan);
+        let extra = emit_region_scan(builder, cpu, ptr_ty, start, segment.len, false, failed);
+        builder.ins().jump(compare, &[extra.into()]);
+        builder.switch_to_block(compare);
+        let live = builder.block_params(compare)[0];
+        let expected = &expected_code
+            [segment.code_offset as usize..(segment.code_offset + segment.len) as usize];
+        let segment_difference = emit_trace_code_segment_difference(builder, live, expected);
+        difference = builder.ins().bor(difference, segment_difference);
+    }
+    let changed = builder.ins().icmp_imm(IntCC::NotEqual, difference, 0);
+    builder.ins().brif(changed, failed, &[], run, &[]);
+
+    builder.switch_to_block(run);
+    let call = builder.ins().call(body, body_args);
+    let result = builder.inst_results(call)[0];
+    builder.ins().return_(&[result]);
+
+    builder.switch_to_block(failed);
+    let validation_needed = builder
+        .ins()
+        .iconst(types::I64, TRACE_RETURN_VALIDATION_NEEDED as i64);
+    builder.ins().return_(&[validation_needed]);
+}
+
 enum SlowTraceCodeValidation {
     Valid,
     Changed { index: usize, ppc: u32, opcode: u16 },
@@ -1314,6 +1389,9 @@ fn validate_trace_code<B: AddressBus>(
 ) -> SlowTraceCodeValidation {
     let unchanged = if cpu.fm_mmu.enabled() {
         translated_code_segments_eq(cpu, &trace.code, &trace.code_segments)
+    } else if cpu.fm_region_count != 0 || cpu.fm_readonly {
+        // Code can live in an extra region; resolve every segment there.
+        code_regions_equal(cpu, &trace.code, &trace.code_segments)
     } else {
         cpu.fm_len != 0
             && trace_code_segments_eq(
@@ -1406,6 +1484,11 @@ struct CompiledTrace {
     translated: bool,
     // Native accesses retain the original code shape with one writable window.
     multi_window: bool,
+    /// The primary window was read-only at compile time (ROM promoted
+    /// because the bus offered no writable `FastMem`). Stores then go
+    /// straight to the region table; a writable primary needs no store-time
+    /// permission test.
+    primary_readonly: bool,
     /// Address-masked range of the trace's code bytes; trace stores into
     /// this range bail so self-modification is observed like the
     /// interpreter would. Baked into the compiled function on native
@@ -1955,7 +2038,8 @@ impl TraceJit {
             }
             if trace.needs_window
                 && (trace.tracked_writes != (cpu.fm_write_hook != 0)
-                    || trace.multi_window != (cpu.fm_readonly || cpu.fm_region_count != 0))
+                    || trace.multi_window != (cpu.fm_readonly || cpu.fm_region_count != 0)
+                    || trace.primary_readonly != cpu.fm_readonly)
             {
                 // Memory capabilities can change between batches. Re-record
                 // before entering code specialized for the previous bus mode.
@@ -3855,6 +3939,7 @@ impl TraceJit {
             tracked_writes: cpu.fm_write_hook != 0,
             translated: cpu.fm_mmu.enabled(),
             multi_window: cpu.fm_readonly || cpu.fm_region_count != 0,
+            primary_readonly: cpu.fm_readonly,
         })
         .ok_or(RegionRejectReason::Backend)
     }
@@ -3875,6 +3960,7 @@ impl TraceJit {
             tracked_writes,
             translated,
             multi_window,
+            primary_readonly,
             code_start,
             code_end,
             aligned_only,
@@ -3977,8 +4063,6 @@ impl TraceJit {
                     ptr_ty,
                     crate::core::window::trace_window_off as *const () as usize as i64,
                 );
-                let fm_readonly = multi_window
-                    .then(|| load_u8(&mut builder, cpu_ptr, offset_of!(CpuCore, fm_readonly)));
                 let mut pointer_sig = module.make_signature();
                 pointer_sig.params.push(AbiParam::new(ptr_ty));
                 pointer_sig.params.push(AbiParam::new(types::I32));
@@ -3991,7 +4075,7 @@ impl TraceJit {
                     )
                 });
                 Some(MemEnv {
-                    fm_readonly,
+                    primary_readonly,
                     resolved_ptrs: std::cell::RefCell::new(std::collections::HashMap::new()),
                     pointer_sig,
                     pointer_fn,
@@ -4474,7 +4558,14 @@ impl TraceJit {
                 builder.append_block_params_for_function_params(block);
                 let body_args = builder.block_params(block).to_vec();
                 let cpu_ptr = body_args[0];
-                emit_checked_trace_wrapper(
+                // Extra regions need a mapping lookup per code segment;
+                // the single-window entry keeps its original checks.
+                let emit_wrapper = if multi_window {
+                    emit_checked_multi_window_trace_wrapper
+                } else {
+                    emit_checked_trace_wrapper
+                };
+                emit_wrapper(
                     &mut builder,
                     cpu_ptr,
                     ptr_ty,
@@ -4538,6 +4629,7 @@ impl TraceJit {
             tracked_writes,
             translated,
             multi_window,
+            primary_readonly,
             code_start,
             code_end,
             #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
@@ -4576,6 +4668,7 @@ impl TraceJit {
             tracked_writes: params.tracked_writes,
             translated: params.translated,
             multi_window: params.multi_window,
+            primary_readonly: params.primary_readonly,
             code_start: params.code_start,
             code_end: params.code_end,
             #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
@@ -4602,6 +4695,11 @@ struct CompileParams<'a> {
     translated: bool,
     // Native accesses retain the original code shape with one writable window.
     multi_window: bool,
+    /// The primary window was read-only at compile time (ROM promoted
+    /// because the bus offered no writable `FastMem`). Stores then go
+    /// straight to the region table; a writable primary needs no store-time
+    /// permission test.
+    primary_readonly: bool,
     code_start: u32,
     code_end: u32,
     callee_start: u32,
@@ -9598,6 +9696,11 @@ struct MemEnv {
     translated: bool,
     // Native accesses retain the original code shape with one writable window.
     multi_window: bool,
+    /// The primary window was read-only at compile time (ROM promoted
+    /// because the bus offered no writable `FastMem`). Stores then go
+    /// straight to the region table; a writable primary needs no store-time
+    /// permission test.
+    primary_readonly: bool,
     cpu: Value,
     translate_sig: cranelift_codegen::ir::SigRef,
     translate_fn: Value,
@@ -9611,7 +9714,6 @@ struct MemEnv {
     fm_ptr_ty: Type,
     fm_base: Value,
     fm_len: Value,
-    fm_readonly: Option<Value>,
     resolved_ptrs: std::cell::RefCell<std::collections::HashMap<Value, Value>>,
     pointer_sig: cranelift_codegen::ir::SigRef,
     pointer_fn: Option<Value>,
@@ -9714,23 +9816,26 @@ fn resolved_window_off(
         branch_guard(builder, bail, outside);
         return off;
     }
-    let short = builder
-        .ins()
-        .icmp_imm(IntCC::UnsignedLessThan, env.fm_len, i64::from(bytes));
+    if write && env.primary_readonly {
+        // A promoted read-only primary can never take a store.
+        let ptr = extra_window_pointer(builder, env, bail, masked, bytes, write);
+        env.resolved_ptrs.borrow_mut().insert(off, ptr);
+        return off;
+    }
+    // Same range test as the single-window emitter: run_batch installs only
+    // windows of at least four bytes, and a writable primary needs no
+    // permission test. A miss searches the extra regions out of line.
     let limit = builder.ins().iadd_imm(env.fm_len, -i64::from(bytes));
-    let outside = builder.ins().icmp(IntCC::UnsignedGreaterThan, off, limit);
-    let mut miss = builder.ins().bor(short, outside);
-    if write {
-        let readonly = builder.ins().icmp_imm(
-            IntCC::NotEqual,
-            env.fm_readonly.expect("multi-window emitter"),
-            0,
-        );
-        miss = builder.ins().bor(miss, readonly);
+    let mut miss = builder.ins().icmp(IntCC::UnsignedGreaterThan, off, limit);
+    if bytes > 4 {
+        let short = builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThan, env.fm_len, i64::from(bytes));
+        miss = builder.ins().bor(miss, short);
     }
     let slow = builder.create_block();
+    builder.set_cold_block(slow);
     let join = builder.create_block();
-    builder.append_block_param(join, types::I32);
     builder.append_block_param(join, env.fm_ptr_ty);
     let off_ptr = if env.fm_ptr_ty == types::I32 {
         off
@@ -9738,17 +9843,14 @@ fn resolved_window_off(
         builder.ins().uextend(env.fm_ptr_ty, off)
     };
     let primary = builder.ins().iadd(env.fm_ptr, off_ptr);
-    builder
-        .ins()
-        .brif(miss, slow, &[], join, &[off.into(), primary.into()]);
+    builder.ins().brif(miss, slow, &[], join, &[primary.into()]);
     builder.switch_to_block(slow);
     let extra = extra_window_pointer(builder, env, bail, masked, bytes, write);
-    builder.ins().jump(join, &[off.into(), extra.into()]);
+    builder.ins().jump(join, &[extra.into()]);
     builder.switch_to_block(join);
-    let off = builder.block_params(join)[0];
     env.resolved_ptrs
         .borrow_mut()
-        .insert(off, builder.block_params(join)[1]);
+        .insert(off, builder.block_params(join)[0]);
     off
 }
 
@@ -9763,29 +9865,45 @@ fn extra_window_pointer(
     bytes: u32,
     write: bool,
 ) -> Value {
+    emit_region_scan(builder, env.cpu, env.fm_ptr_ty, address, bytes, write, bail)
+}
+
+/// Host pointer for `bytes` at physical `address` in one extra region, or a
+/// branch to `miss` when no region covers the whole range (with write
+/// permission when `write`).
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_region_scan(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    ptr_ty: Type,
+    address: Value,
+    bytes: u32,
+    write: bool,
+    miss: Block,
+) -> Value {
     use crate::core::window::Region;
     let count = builder.ins().load(
-        env.fm_ptr_ty,
+        ptr_ty,
         MemFlags::trusted(),
-        env.cpu,
+        cpu,
         offset_of!(CpuCore, fm_region_count) as i32,
     );
     let table = builder
         .ins()
-        .iadd_imm(env.cpu, offset_of!(CpuCore, fm_regions) as i64);
+        .iadd_imm(cpu, offset_of!(CpuCore, fm_regions) as i64);
     let scan = builder.create_block();
     let next = builder.create_block();
     let found = builder.create_block();
-    builder.append_block_param(scan, env.fm_ptr_ty);
-    builder.append_block_param(found, env.fm_ptr_ty);
-    let zero = builder.ins().iconst(env.fm_ptr_ty, 0);
+    builder.append_block_param(scan, ptr_ty);
+    builder.append_block_param(found, ptr_ty);
+    let zero = builder.ins().iconst(ptr_ty, 0);
     builder.ins().jump(scan, &[zero.into()]);
     builder.switch_to_block(scan);
     let index = builder.block_params(scan)[0];
     let exhausted = builder
         .ins()
         .icmp(IntCC::UnsignedGreaterThanOrEqual, index, count);
-    branch_guard(builder, bail, exhausted);
+    branch_guard(builder, miss, exhausted);
     let offset = builder
         .ins()
         .imul_imm(index, std::mem::size_of::<Region>() as i64);
@@ -9798,25 +9916,27 @@ fn extra_window_pointer(
         .icmp_imm(IntCC::UnsignedLessThan, len, i64::from(bytes));
     let end = builder.ins().iadd_imm(len, -i64::from(bytes));
     let outside = builder.ins().icmp(IntCC::UnsignedGreaterThan, off, end);
-    let mut miss = builder.ins().bor(short, outside);
+    let mut region_miss = builder.ins().bor(short, outside);
     if write {
         let writable = load_u8(builder, region, offset_of!(Region, writable));
         let readonly = builder.ins().icmp_imm(IntCC::Equal, writable, 0);
-        miss = builder.ins().bor(miss, readonly);
+        region_miss = builder.ins().bor(region_miss, readonly);
     }
     let ptr = builder.ins().load(
-        env.fm_ptr_ty,
+        ptr_ty,
         MemFlags::trusted(),
         region,
         offset_of!(Region, ptr) as i32,
     );
-    let off = if env.fm_ptr_ty == types::I32 {
+    let off = if ptr_ty == types::I32 {
         off
     } else {
-        builder.ins().uextend(env.fm_ptr_ty, off)
+        builder.ins().uextend(ptr_ty, off)
     };
     let ptr = builder.ins().iadd(ptr, off);
-    builder.ins().brif(miss, next, &[], found, &[ptr.into()]);
+    builder
+        .ins()
+        .brif(region_miss, next, &[], found, &[ptr.into()]);
     builder.switch_to_block(next);
     let index = builder.ins().iadd_imm(index, 1);
     builder.ins().jump(scan, &[index.into()]);

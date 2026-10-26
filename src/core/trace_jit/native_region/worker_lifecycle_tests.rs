@@ -42,6 +42,7 @@ fn input(root: u32) -> RegionInput {
             needs_window: false,
             tracked_writes: false,
             multi_window: false,
+            primary_readonly: false,
             checked: 0,
             body: 0,
         }],

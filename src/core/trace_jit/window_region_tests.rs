@@ -248,6 +248,7 @@ fn compiled_once(c: &mut CpuCore, b: &mut Bus, pc: u32) -> u32 {
         assert_eq!(trace.pc, pc);
         assert_eq!(trace.translated, c.fm_mmu.enabled());
         assert_eq!(trace.multi_window, c.fm_readonly || c.fm_region_count != 0);
+        assert_eq!(trace.primary_readonly, c.fm_readonly);
         #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         // SAFETY: live, disjoint windows remain installed for the call; the
         // unchanged code was compiled with this CPU and window mode.
@@ -368,6 +369,72 @@ fn switching_between_single_and_multiple_windows_rerecords() {
         c.set_a(0, PRIMARY + 128);
         c.run_batch(&mut b, 16384, &[]);
         assert_eq!(compiled_once(&mut c, &mut b, PRIMARY), 4);
+    }
+}
+
+#[test]
+fn switching_primary_write_permission_rerecords() {
+    // move.l (a0),d0; addq.l #1,d0; move.l d0,(a1); bra.s loop, from ROM.
+    // Without a writable FastMem the ROM region is promoted to a read-only
+    // primary; stores to RAM must still resolve through the region table.
+    let mut b = Bus::new(&[0x2010, 0x5280, 0x2280, 0x60f8]);
+    let mut c = cpu();
+    c.set_a(0, RAM);
+    c.set_a(1, RAM);
+    for primary_enabled in [false, true, false] {
+        b.primary_enabled = primary_enabled;
+        c.pc = ROM;
+        c.run_batch(&mut b, 16384, &[]);
+        let before = u32::from_be_bytes(b.ram[..4].try_into().unwrap());
+        assert_eq!(compiled_once(&mut c, &mut b, ROM), 4);
+        let after = u32::from_be_bytes(b.ram[..4].try_into().unwrap());
+        assert_eq!(
+            after,
+            before.wrapping_add(1),
+            "store reached the RAM region"
+        );
+    }
+}
+
+/// x86-64 traces validate their code in a generated entry. Code that lives
+/// in an extra region must validate there too, not return to the host on
+/// every entry, and a changed byte must still be caught before execution.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[test]
+fn generated_validation_reads_code_from_extra_regions() {
+    let mut b = Bus::new(&[0x2010, 0x5280, 0x2280, 0x60f8]);
+    let mut c = cpu();
+    c.set_a(0, RAM);
+    c.set_a(1, RAM + 128);
+    c.run_batch(&mut b, 16384, &[]);
+    for changed in [false, true] {
+        if changed {
+            b.rom[2] ^= 0x01; // addq.l #1,d0 -> addq.l #1,d1
+        }
+        install_windows(&mut c, &mut b);
+        c.pc = ROM;
+        let registers = c.dar;
+        let packed = super::with_trace_jit(|jit| {
+            let super::TraceSlot::Compiled(trace) = &jit.slots[super::trace_cache_index(ROM)]
+            else {
+                panic!("the warm-up must compile the ROM loop");
+            };
+            assert!(trace.multi_window);
+            // SAFETY: live, disjoint windows remain installed for the call.
+            unsafe { trace.call_checked(&mut c, 1) }
+        });
+        if changed {
+            assert!(super::trace_return_validation_needed(packed));
+            assert_eq!(c.dar, registers, "validation precedes execution");
+        } else {
+            assert!(!super::trace_return_validation_needed(packed));
+            assert_eq!(super::trace_return_retired(packed), 4);
+        }
+        c.fm_ptr = 0;
+        c.fm_base = 0;
+        c.fm_len = 0;
+        c.fm_region_count = 0;
+        c.fm_readonly = false;
     }
 }
 
