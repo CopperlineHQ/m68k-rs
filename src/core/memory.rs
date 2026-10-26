@@ -323,9 +323,14 @@ pub trait AddressBus {
     /// native prefix exits to a bus access. Return `true` to yield with
     /// [`BatchExit::BoundaryRequested`](crate::BatchExit::BoundaryRequested);
     /// completed work is retained and the next instruction has not executed.
-    /// An opcode fetch can already have occurred. Account for any final work
-    /// from `BatchResult::instructions` on return, since there need not be a
-    /// final hook call when a budget, trap, or watched PC ends the batch.
+    ///
+    /// An opcode fetched through the bus (not through a memory window) is
+    /// followed by a second call with the same `retired` count and `pc`, so a
+    /// boundary the fetch itself raised is honored before that instruction
+    /// runs. Yielding there discards the fetched opcode: the bus sees the same
+    /// fetch again when execution resumes. Account for any final work from
+    /// `BatchResult::instructions` on return, since there need not be a final
+    /// hook call when a budget, trap, or watched PC ends the batch.
     ///
     /// Do not relocate or resize an exposed memory window from this hook.
     /// Return to the caller before changing the window's address range or

@@ -217,10 +217,12 @@ fn emulate(cpu: &mut CpuCore, bus: &mut impl AddressBus) {
 An instruction-budgeted host can implement `AddressBus::batch_boundary` to
 synchronize peripherals before an interpreted device access following a native
 trace. The callback receives the cumulative retired count, next PC and SR, and
-can return `true` to yield with `BatchExit::BoundaryRequested`. Native traces
-can retire the entire remaining budget between callbacks; choose a budget that
-respects the next device deadline and account for the final `BatchResult` count
-on return. The default callback adds no work for buses that do not need it.
+can return `true` to yield with `BatchExit::BoundaryRequested`. An opcode
+fetched through the bus gets a second callback before it dispatches; yielding
+there repeats the fetch on resume. Native traces can retire the entire remaining
+budget between callbacks; choose a budget that respects the next device deadline
+and account for the final `BatchResult` count on return. The default callback
+adds no work for buses that do not need it.
 
 Use **`step()`** for debugger-style control. Use **`run_for_cycles()`** when a
 machine scheduler needs to advance the CPU by a clock budget without losing

@@ -1688,6 +1688,27 @@ mod batch_host_boundary_tests {
         assert_eq!(split.get_sr(), whole.get_sr());
     }
 
+    /// The decoded fast loop must honor a boundary raised by a bus opcode
+    /// fetch before the simple instruction dispatches, like full dispatch.
+    #[test]
+    fn boundary_raised_by_decoded_opcode_fetch_yields_before_dispatch() {
+        let mut bus = Bus::new();
+        bus.direct = false;
+        bus.stop_on_fetch = Some(0x104); // ADDQ.L #1,D0
+        let mut cpu = cpu();
+        let result = cpu.run_batch(&mut bus, 1000, &[]);
+        assert_eq!(result.exit, BatchExit::BoundaryRequested);
+        assert_eq!(result.instructions, 2);
+        assert_eq!(cpu.pc, 0x104);
+        assert_eq!(cpu.d(0), 0, "the fetched instruction has not executed");
+        bus.stop_on_fetch = None;
+        bus.fetched_boundary = false;
+        let result = cpu.run_batch(&mut bus, 1, &[]);
+        assert_eq!(result.instructions, 1);
+        assert_eq!(cpu.pc, 0x106);
+        assert_eq!(cpu.d(0), 1);
+    }
+
     #[test]
     fn boundary_raised_by_opcode_fetch_yields_before_dispatch() {
         let mut bus = Bus::new();

@@ -1136,6 +1136,7 @@ impl CpuCore {
             }
 
             self.ppc = self.pc;
+            let mut fetched_via_bus = false;
             let opcode = if self.fm_len != 0 && (self.pc & 1) == 0 {
                 // Fetch through the fastmem window: one bounds check
                 // instead of a bus call. Odd/out-of-window PCs, and PCs the
@@ -1164,6 +1165,7 @@ impl CpuCore {
                     if self.run_mode == RUN_MODE_BERR_AERR_RESET {
                         return BatchInnerExit::Fault;
                     }
+                    fetched_via_bus = true;
                     opcode
                 }
             } else {
@@ -1171,8 +1173,18 @@ impl CpuCore {
                 if self.run_mode == RUN_MODE_BERR_AERR_RESET {
                     return BatchInnerExit::Fault;
                 }
+                fetched_via_bus = true;
                 opcode
             };
+            // A bus fetch can itself be the access the host must synchronize
+            // with. Yield before dispatch, exactly as full dispatch does; the
+            // opcode is fetched again when the batch resumes. Window fetches
+            // have no side effects and skip the call.
+            if fetched_via_bus && bus.batch_boundary(*retired, self.ppc, self.get_sr()) {
+                self.pc = self.ppc;
+                trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
+                return BatchInnerExit::Boundary;
+            }
             self.ir = opcode as u32;
 
             match self.cached_decode(opcode, cpu_type) {
