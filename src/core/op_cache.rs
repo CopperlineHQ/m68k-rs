@@ -1179,8 +1179,12 @@ impl CpuCore {
             // A bus fetch can itself be the access the host must synchronize
             // with. Yield before dispatch, exactly as full dispatch does; the
             // opcode is fetched again when the batch resumes. Window fetches
-            // have no side effects and skip the call.
-            if fetched_via_bus && bus.batch_boundary(*retired, self.ppc, self.get_sr()) {
+            // have no side effects and skip the call, and so does the first
+            // instruction of a batch, which must make progress.
+            if fetched_via_bus
+                && *retired != 0
+                && bus.batch_boundary(*retired, self.ppc, self.get_sr())
+            {
                 self.pc = self.ppc;
                 trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
                 return BatchInnerExit::Boundary;

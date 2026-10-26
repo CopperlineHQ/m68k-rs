@@ -839,7 +839,9 @@ impl CpuCore {
                 opcode
             };
 
-            if bus.batch_boundary(retired, self.ppc, self.get_sr()) {
+            // The first instruction of a batch always dispatches once fetched:
+            // yielding there would retire nothing and repeat the same fetch.
+            if retired != 0 && bus.batch_boundary(retired, self.ppc, self.get_sr()) {
                 self.pc = self.ppc;
                 trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
                 return BatchResult {
@@ -1707,6 +1709,20 @@ mod batch_host_boundary_tests {
         assert_eq!(result.instructions, 1);
         assert_eq!(cpu.pc, 0x106);
         assert_eq!(cpu.d(0), 1);
+    }
+
+    /// A boundary raised by the first fetch of a batch cannot stall it: that
+    /// instruction runs, and the host gets its boundary at the next one.
+    #[test]
+    fn fetch_raised_boundary_at_batch_entry_still_makes_progress() {
+        let mut bus = Bus::new();
+        bus.direct = false;
+        bus.stop_on_fetch = Some(0x100); // MOVEQ #0,D0, the first instruction
+        let mut cpu = cpu();
+        let result = cpu.run_batch(&mut bus, 1000, &[]);
+        assert_eq!(result.exit, BatchExit::BoundaryRequested);
+        assert_eq!(result.instructions, 1);
+        assert_eq!(cpu.pc, 0x102);
     }
 
     #[test]

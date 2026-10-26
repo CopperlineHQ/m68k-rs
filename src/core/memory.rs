@@ -324,11 +324,14 @@ pub trait AddressBus {
     /// [`BatchExit::BoundaryRequested`](crate::BatchExit::BoundaryRequested);
     /// completed work is retained and the next instruction has not executed.
     ///
-    /// An opcode fetched through the bus (not through a memory window) is
-    /// followed by a second call with the same `retired` count and `pc`, so a
-    /// boundary the fetch itself raised is honored before that instruction
-    /// runs. Yielding there discards the fetched opcode: the bus sees the same
-    /// fetch again when execution resumes. Account for any final work from
+    /// Once an instruction has completed in the batch, an opcode fetched
+    /// through the bus (not through a memory window) is followed by a second
+    /// call with the same `retired` count and `pc`, so a boundary the fetch
+    /// itself raised is honored before that instruction runs. Yielding there
+    /// discards the fetched opcode: the bus sees the same fetch again when
+    /// execution resumes. The first instruction of a batch always runs once
+    /// fetched, so a batch makes progress even if every fetch raises a
+    /// boundary. Account for any final work from
     /// `BatchResult::instructions` on return, since there need not be a final
     /// hook call when a budget, trap, or watched PC ends the batch.
     ///
