@@ -1023,6 +1023,7 @@ impl CpuCore {
         watch_pcs: &[u32],
         retired: &mut u32,
         probe_on_entry: bool,
+        boundaries: bool,
     ) -> BatchInnerExit {
         // Only a fully dispatched instruction, outside this loop, switches
         // the window between physical and translated, so the loop is
@@ -1035,6 +1036,7 @@ impl CpuCore {
                 watch_pcs,
                 retired,
                 probe_on_entry,
+                boundaries,
             );
         }
         self.run_decoded_simple_batch_in::<B, false>(
@@ -1043,6 +1045,7 @@ impl CpuCore {
             watch_pcs,
             retired,
             probe_on_entry,
+            boundaries,
         )
     }
 
@@ -1062,10 +1065,18 @@ impl CpuCore {
         watch_pcs: &[u32],
         retired: &mut u32,
         probe_on_entry: bool,
+        boundaries: bool,
     ) -> BatchInnerExit {
         // Whatever ran since the last decoded run may have changed the ATC.
         self.forget_code_page();
-        self.run_decoded_simple_batch_in::<B, true>(bus, budget, watch_pcs, retired, probe_on_entry)
+        self.run_decoded_simple_batch_in::<B, true>(
+            bus,
+            budget,
+            watch_pcs,
+            retired,
+            probe_on_entry,
+            boundaries,
+        )
     }
 
     #[inline]
@@ -1076,6 +1087,7 @@ impl CpuCore {
         watch_pcs: &[u32],
         retired: &mut u32,
         probe_on_entry: bool,
+        boundaries: bool,
     ) -> BatchInnerExit {
         let cpu_type = self.cpu_type;
         let watch = !watch_pcs.is_empty();
@@ -1085,7 +1097,7 @@ impl CpuCore {
         let mut probe = probe_on_entry && trace_jit::has_trace_candidates();
 
         while remaining > 0 {
-            if bus.batch_boundary(*retired, self.pc, self.get_sr()) {
+            if boundaries && bus.batch_boundary(*retired, self.pc, self.get_sr()) {
                 trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
                 return BatchInnerExit::Boundary;
             }
@@ -1181,7 +1193,8 @@ impl CpuCore {
             // opcode is fetched again when the batch resumes. Window fetches
             // have no side effects and skip the call, and so does the first
             // instruction of a batch, which must make progress.
-            if fetched_via_bus
+            if boundaries
+                && fetched_via_bus
                 && *retired != 0
                 && bus.batch_boundary(*retired, self.ppc, self.get_sr())
             {

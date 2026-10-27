@@ -343,6 +343,18 @@ pub trait AddressBus {
         false
     }
 
+    /// Whether [`CpuCore::run_batch`](super::cpu::CpuCore::run_batch) calls
+    /// [`batch_boundary`](Self::batch_boundary) during the batch it is
+    /// starting. The core asks once, after capturing the memory windows and
+    /// before the first instruction. Return `false` when nothing in this
+    /// batch needs to be observed before it returns: the batch then runs
+    /// without boundary calls until its budget, a trap, STOP or a watched PC
+    /// ends it. The default keeps the calls.
+    #[inline]
+    fn wants_batch_boundaries(&mut self) -> bool {
+        true
+    }
+
     /// Take a pending request to return from cycle-scheduled execution at
     /// the next completed instruction or interrupt-entry boundary.
     ///

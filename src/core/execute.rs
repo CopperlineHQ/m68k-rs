@@ -740,6 +740,7 @@ impl CpuCore {
             };
         }
 
+        let boundaries = bus.wants_batch_boundaries();
         let mut retired: u32 = 0;
         let mut probe_on_entry = true;
 
@@ -756,7 +757,7 @@ impl CpuCore {
         }
 
         loop {
-            if bus.batch_boundary(retired, self.pc, self.get_sr()) {
+            if boundaries && bus.batch_boundary(retired, self.pc, self.get_sr()) {
                 trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
                 return BatchResult {
                     instructions: retired,
@@ -788,6 +789,7 @@ impl CpuCore {
                     watch_pcs,
                     &mut retired,
                     probe_on_entry,
+                    boundaries,
                 ) {
                     BatchInnerExit::Boundary => {
                         return BatchResult {
@@ -841,7 +843,7 @@ impl CpuCore {
 
             // The first instruction of a batch always dispatches once fetched:
             // yielding there would retire nothing and repeat the same fetch.
-            if retired != 0 && bus.batch_boundary(retired, self.ppc, self.get_sr()) {
+            if boundaries && retired != 0 && bus.batch_boundary(retired, self.ppc, self.get_sr()) {
                 self.pc = self.ppc;
                 trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
                 return BatchResult {
@@ -1581,6 +1583,7 @@ mod batch_host_boundary_tests {
         direct: bool,
         stop_on_fetch: Option<u32>,
         fetched_boundary: bool,
+        boundaries: bool,
     }
     impl Bus {
         fn new() -> Self {
@@ -1600,6 +1603,7 @@ mod batch_host_boundary_tests {
                 direct: true,
                 stop_on_fetch: None,
                 fetched_boundary: false,
+                boundaries: true,
             }
         }
     }
@@ -1637,6 +1641,9 @@ mod batch_host_boundary_tests {
         fn batch_boundary(&mut self, retired: u32, _pc: u32, _sr: u16) -> bool {
             self.synced = retired;
             self.fetched_boundary || retired >= self.stop_at
+        }
+        fn wants_batch_boundaries(&mut self) -> bool {
+            self.boundaries
         }
     }
     fn cpu() -> CpuCore {
@@ -1723,6 +1730,34 @@ mod batch_host_boundary_tests {
         assert_eq!(result.exit, BatchExit::BoundaryRequested);
         assert_eq!(result.instructions, 1);
         assert_eq!(cpu.pc, 0x102);
+    }
+
+    /// A bus that declines boundaries for a batch gets no calls at all, from
+    /// the window, decoded or full-dispatch paths, and the batch runs to its
+    /// budget exactly as an unhooked one would.
+    #[test]
+    fn declined_boundaries_run_the_whole_budget_without_calls() {
+        for direct in [true, false] {
+            let mut bus = Bus::new();
+            bus.direct = direct;
+            bus.boundaries = false;
+            bus.stop_at = 1;
+            bus.stop_on_fetch = Some(0x104);
+            let mut declined = cpu();
+            let result = declined.run_batch(&mut bus, 132 * 3, &[]);
+            assert_eq!(result.exit, BatchExit::BudgetExhausted);
+            assert_eq!(result.instructions, 132 * 3);
+            assert_eq!(bus.synced, 0, "no boundary call");
+            assert_eq!(bus.writes, [(0, 64), (0, 64), (0, 64)]);
+            let mut whole = cpu();
+            let mut plain = Bus::new();
+            plain.direct = direct;
+            whole.run_batch(&mut plain, 132 * 3, &[]);
+            assert_eq!(declined.pc, whole.pc);
+            assert_eq!(declined.d(0), whole.d(0));
+            assert_eq!(declined.d(1), whole.d(1));
+            assert_eq!(declined.get_sr(), whole.get_sr());
+        }
     }
 
     #[test]
