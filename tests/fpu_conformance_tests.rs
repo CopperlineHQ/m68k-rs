@@ -54,6 +54,7 @@ const CC_NAN: u32 = 0x0100_0000;
 /// FPSR exception-status bits.
 const EXC_BSUN: u32 = 0x8000;
 const EXC_SNAN: u32 = 0x4000;
+const EXC_OPERR: u32 = 0x2000;
 /// FPSR accrued-exception bits.
 const AEXC_IOP: u32 = 0x0080;
 const AEXC_INEX: u32 = 0x0008;
@@ -546,4 +547,125 @@ fn fsave_idle_frames_round_trip_through_frestore() {
         assert_eq!(m.bus.read_long(DATA + 0x100 - size), header, "{cpu:?}");
         assert_eq!(m.cpu.dar[8], DATA + 0x100, "{cpu:?}: (A0)+ pops the frame");
     }
+}
+
+/// Run `code` (an FPU operation, then FNOP) with FP1 = `src`, FP0 =
+/// `dst`, FPSR = `fpsr` and FPCR = `fpcr`.
+fn exc_run(
+    cpu: CpuType,
+    code: &[u16],
+    src: (u16, u64),
+    dst: (u16, u64),
+    fpcr: u32,
+    fpsr: u32,
+) -> Machine {
+    let mut m = Machine::new(cpu);
+    m.cpu.fpr[1] = x80(src.0, src.1);
+    m.cpu.fpr[0] = x80(dst.0, dst.1);
+    m.cpu.fpsr = fpsr;
+    m.cpu.fpcr = fpcr;
+    m.cpu.fpiar = 0;
+    let mut prog = code.to_vec();
+    prog.extend([0xF280, 0x0000]); // FNOP
+    m.run(&prog);
+    m
+}
+
+#[test]
+fn enabled_arithmetic_exceptions_trap_through_their_vectors() {
+    let one = (0x3FFF, 0x8000_0000_0000_0000);
+    let two = (0x4000, 0x8000_0000_0000_0000);
+    let three = (0x4000, 0xC000_0000_0000_0000);
+    let max = (0x7FFE, 0xFFFF_FFFF_FFFF_FFFF);
+    let tiny = (0x0001, 0x8000_0000_0000_0000);
+    let minus_one = (0xBFFF, 0x8000_0000_0000_0000);
+    // (name, opmode, src, dst, FPCR enable = FPSR exception bit, vector)
+    let cases = [
+        ("OVFL", 0x23, two, max, 0x1000, 53),        // FMUL max * 2
+        ("UNFL", 0x23, tiny, tiny, 0x0800, 51),      // FMUL tiny * tiny
+        ("DZ", 0x20, (0, 0), one, 0x0400, 50),       // FDIV 1 / 0
+        ("OPERR", 0x04, minus_one, one, 0x2000, 52), // FSQRT -1
+        ("INEX2", 0x20, three, one, 0x0200, 49),     // FDIV 1 / 3
+        ("SNAN", 0x22, SNAN_X, one, 0x4000, 54),     // FADD SNaN + 1
+    ];
+    for cpu in ALL_FPUS {
+        for (name, opmode, src, dst, enable, vector) in cases {
+            let mut m = exc_run(cpu, &[0xF200, 0x0400 | opmode], src, dst, enable, 0);
+            assert_eq!(m.vector(), Some(vector), "{cpu:?} {name}");
+            let (_, pc, fv) = m.frame();
+            assert_eq!(pc, CODE + 4, "{cpu:?} {name}: PC of the next instruction");
+            assert_eq!(fv, (vector * 4) as u16, "{cpu:?} {name}: format $0");
+            assert_ne!(m.cpu.fpsr & enable, 0, "{cpu:?} {name}: FPSR bit");
+            assert_eq!(m.cpu.fpiar, CODE, "{cpu:?} {name}: FPIAR");
+
+            // Disabled, the same operation completes.
+            let m = exc_run(cpu, &[0xF200, 0x0400 | opmode], src, dst, 0, 0);
+            assert_eq!(m.vector(), None, "{cpu:?} {name} disabled");
+            assert_ne!(m.cpu.fpsr & enable, 0, "{cpu:?} {name} disabled: FPSR bit");
+        }
+        // Several enabled: the highest priority wins (OVFL over INEX2).
+        let m = exc_run(cpu, &[0xF200, 0x0423], two, max, 0x1200, 0);
+        assert_eq!(m.vector(), Some(53), "{cpu:?} OVFL+INEX2");
+        // A raised exception that is not enabled does not trap.
+        let m = exc_run(cpu, &[0xF200, 0x0423], two, max, 0x0400, 0);
+        assert_eq!(m.vector(), None, "{cpu:?} only DZ enabled");
+    }
+}
+
+#[test]
+fn enabled_bsun_traps_before_the_conditional_executes() {
+    for cpu in ALL_FPUS {
+        // FBGT.W *+2 (predicate GT, IEEE-nonaware) with NAN set.
+        let mut m = exc_run(cpu, &[0xF292, 0x0002], (0, 0), (0, 0), 0x8000, CC_NAN);
+        assert_eq!(m.vector(), Some(48), "{cpu:?}");
+        let (_, pc, fv) = m.frame();
+        assert_eq!(pc, CODE, "{cpu:?}: the stacked PC restarts FBcc");
+        assert_eq!(fv, 48 * 4, "{cpu:?}: format $0");
+        assert_eq!(m.cpu.fpsr, CC_NAN | EXC_BSUN | AEXC_IOP, "{cpu:?}");
+        // The IEEE-aware OGT does not signal.
+        let m = exc_run(cpu, &[0xF282, 0x0002], (0, 0), (0, 0), 0x8000, CC_NAN);
+        assert_eq!(m.vector(), None, "{cpu:?} OGT");
+    }
+    // FScc and FTRAPcc take it too on the 6888x and 68040.
+    for cpu in [CpuType::M68030, CpuType::M68040] {
+        let m = exc_run(cpu, &[0xF240, 0x0012], (0, 0), (0, 0), 0x8000, CC_NAN);
+        assert_eq!(m.vector(), Some(48), "{cpu:?} FSGT");
+        assert_eq!(m.cpu.dar[0] & 0xFF, 0, "{cpu:?}: FScc did not write");
+        let m = exc_run(cpu, &[0xF27C, 0x0012], (0, 0), (0, 0), 0x8000, CC_NAN);
+        assert_eq!(m.vector(), Some(48), "{cpu:?} FTRAPGT");
+    }
+}
+
+#[test]
+fn enabled_inex1_traps_on_a_6888x_packed_source() {
+    // FMOVE.P (A0),FP0 of 1E-1 with INEX1 enabled.
+    let mut m = Machine::new(CpuType::M68030);
+    m.bus.write_long(DATA, 0x4001_0001);
+    m.cpu.dar[8] = DATA;
+    m.cpu.fpcr = 0x0100;
+    m.run(&[0xF210, 0x4C00, 0xF280, 0x0000]);
+    assert_eq!(m.vector(), Some(49));
+    assert_ne!(m.cpu.fpsr & EXC_INEX1, 0);
+    assert_eq!(m.cpu.fpiar, CODE);
+}
+
+#[test]
+fn enabled_6888x_move_out_exception_stacks_the_mid_instruction_frame() {
+    // FMOVE.L FP0,D0 of +inf with OPERR enabled.
+    let mut m = exc_run(
+        CpuType::M68030,
+        &[0xF200, 0x6000],
+        (0, 0),
+        (0x7FFF, 0),
+        0x2000,
+        0,
+    );
+    assert_eq!(m.vector(), Some(52));
+    let (_, pc, fv) = m.frame();
+    assert_eq!(fv, 0x9000 | (52 * 4), "format $9");
+    assert_eq!(pc, CODE + 4, "ScanPC: the next instruction");
+    let sp = m.cpu.dar[15];
+    assert_eq!(m.bus.read_long(sp + 8), CODE, "instruction address at +$08");
+    assert_ne!(m.cpu.fpsr & EXC_OPERR, 0);
+    assert_eq!(m.cpu.fpiar, CODE);
 }

@@ -197,12 +197,13 @@ impl CpuCore {
                     }
                     // FMOVECR - load constant from ROM. The opmode field is
                     // the ROM index; there is no <ea> source operand.
+                    self.fpiar = self.ppc;
                     let ctx = self.fpu_ctx(0);
                     let mut f = ExcFlags::default();
                     self.fpr[dst] = softfloat::fmovecr(opmode as usize, ctx, &mut f);
                     self.fpu_set_cc(self.fpr[dst]);
                     self.fpu_commit(f);
-                    return 4;
+                    return self.fpu_arith_trap(bus, 4);
                 }
 
                 if self.trap_unimpl_060() && fpu_060_traps_opmode(opmode) {
@@ -240,10 +241,12 @@ impl CpuCore {
                     }
                 }
 
+                self.fpiar = self.ppc;
                 let Some((src, src_flags)) = self.fpu_read_source(bus, opcode, src_fmt) else {
                     return 0;
                 };
-                self.fpu_apply_op(opmode, dst, src, src_flags)
+                let cycles = self.fpu_apply_op(opmode, dst, src, src_flags);
+                self.fpu_arith_trap(bus, cycles)
             }
             0x3 => {
                 // FMOVE FP, <ea> - move FP register to memory/integer register
@@ -278,11 +281,20 @@ impl CpuCore {
                 let ea_mode = (ea >> 3) & 7;
                 let ea_reg = (ea & 7) as usize;
 
-                if self.fpu_write_dest(bus, ea_mode, ea_reg, dst_fmt, kfactor, self.fpr[src]) {
-                    4
-                } else {
-                    0
+                self.fpiar = self.ppc;
+                if !self.fpu_write_dest(bus, ea_mode, ea_reg, dst_fmt, kfactor, self.fpr[src]) {
+                    return 0;
                 }
+                // An enabled exception of the conversion is signalled by
+                // the 6888x during the instruction: the 68020/030 stacks
+                // the mid-instruction frame. The 68040/68060 move-out
+                // exception reporting is not modelled; they complete.
+                if self.fpu_is_6888x()
+                    && let Some(vector) = self.fpu_enabled_exception(0x7F)
+                {
+                    return self.take_fp_arith_exception(bus, vector, true);
+                }
+                4
             }
             0x0 => {
                 // FP register-to-register operations (FMOVE FPm,FPn, FADD, FSUB, FMUL, FDIV, FCMP, etc.)
@@ -304,12 +316,13 @@ impl CpuCore {
                     }
                     // FMOVECR - load constant from ROM. In this register-form
                     // encoding the source-register field carries the ROM index.
+                    self.fpiar = self.ppc;
                     let ctx = self.fpu_ctx(0);
                     let mut f = ExcFlags::default();
                     self.fpr[dst] = softfloat::fmovecr(src, ctx, &mut f);
                     self.fpu_set_cc(self.fpr[dst]);
                     self.fpu_commit(f);
-                    return 4;
+                    return self.fpu_arith_trap(bus, 4);
                 }
                 if self.trap_unimpl_060() && fpu_060_traps_opmode(opmode) {
                     // Register-to-register form of an unimplemented FP
@@ -319,7 +332,9 @@ impl CpuCore {
                 if self.trap_unimpl_040() && fpu_040_traps_opmode(opmode) {
                     return self.take_fp_unimp_060(bus, 0);
                 }
-                self.fpu_apply_op(opmode, dst, self.fpr[src], ExcFlags::default())
+                self.fpiar = self.ppc;
+                let cycles = self.fpu_apply_op(opmode, dst, self.fpr[src], ExcFlags::default());
+                self.fpu_arith_trap(bus, cycles)
             }
             0x6 | 0x7 => {
                 // FMOVEM - move multiple FP registers to/from memory
@@ -517,6 +532,47 @@ impl CpuCore {
         }
     }
 
+    /// The highest-priority exception of `mask` (an FPSR exception-byte
+    /// mask) that the instruction just raised with its FPCR enable bit set,
+    /// as its vector: BSUN, SNAN, OPERR, OVFL, UNFL, DZ, then INEX2/INEX1
+    /// sharing vector 49 (MC68881/MC68882UM 6.1 and table 6-2, M68040UM
+    /// 9.5, M68060UM 6.5).
+    fn fpu_enabled_exception(&self, mask: u32) -> Option<u32> {
+        use crate::core::exceptions::vector;
+        let pending = (self.fpsr >> 8) & (self.fpcr >> 8) & mask;
+        [
+            (0x80, vector::FP_BSUN),
+            (0x40, vector::FP_SNAN),
+            (0x20, vector::FP_OPERR),
+            (0x10, vector::FP_OVFL),
+            (0x08, vector::FP_UNFL),
+            (0x04, vector::FP_DZ),
+            (0x03, vector::FP_INEX),
+        ]
+        .into_iter()
+        .find(|&(bit, _)| pending & bit != 0)
+        .map(|(_, v)| v)
+    }
+
+    /// Report an enabled arithmetic exception of the instruction that just
+    /// completed (`cycles` != 0). The FPSR exception and accrued bytes are
+    /// already updated and FPIAR holds the instruction's address; the
+    /// exception is taken through its vector with the format $0 frame
+    /// whose PC is the next instruction, the frame the 6888x, 68040 and
+    /// 68060 stack when they report it at the following FPU instruction
+    /// (MC68881/MC68882UM 6.2, M68040UM 9.5.1, M68060UM 6.5.1). The model
+    /// takes it at the instruction boundary instead of holding it pending
+    /// until that next FPU instruction.
+    fn fpu_arith_trap<B: AddressBus>(&mut self, bus: &mut B, cycles: i32) -> i32 {
+        if cycles == 0 {
+            return 0;
+        }
+        match self.fpu_enabled_exception(0x7F) {
+            Some(vector) => self.take_fp_arith_exception(bus, vector, false),
+            None => cycles,
+        }
+    }
+
     /// The FSxxx/FDxxx opmodes ($40-$7F: FSMOVE, FDADD, FSSQRT, ...) exist
     /// only on the 68040 and 68060 (M68040UM 9.4, M68000PRM 4.3). On a
     /// 6888x they are illegal coprocessor commands, which the 68020/030
@@ -524,6 +580,29 @@ impl CpuCore {
     /// (MC68881/MC68882UM 7.4.2, MC68020UM 10.4.2).
     fn fpu_6888x_illegal_opmode(&self, opmode: u16) -> bool {
         self.fpu_is_6888x() && opmode & 0x40 != 0
+    }
+
+    /// The BSUN exception of a conditional instruction: an IEEE-nonaware
+    /// predicate ($10-$1F) with the NAN condition code set raises BSUN (see
+    /// [`Self::fpu_condition`]); with BSUN enabled in FPCR the instruction
+    /// does not execute and takes vector 48 as a pre-instruction exception,
+    /// format $0 with the stacked PC restarting it (MC68881/MC68882UM 6.1.1,
+    /// M68040UM 9.5.1, M68060UM 6.5.1). The handler must clear NAN or the
+    /// enable before returning. `None` = the instruction proceeds.
+    pub(crate) fn fpu_bsun_exception<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        condition: u8,
+    ) -> Option<i32> {
+        const FPCC_NAN: u32 = 0x0100_0000;
+        if condition & 0x10 == 0 || self.fpsr & FPCC_NAN == 0 {
+            return None;
+        }
+        self.fpsr |= 0x0000_8080; // BSUN, accrued IOP
+        if self.fpcr & 0x8000 == 0 {
+            return None;
+        }
+        Some(self.take_exception(bus, crate::core::exceptions::vector::FP_BSUN))
     }
 
     /// FBcc - FPU conditional branch.
@@ -553,6 +632,9 @@ impl CpuCore {
         ea_reg: usize,
         condition: u8,
     ) -> i32 {
+        if let Some(cycles) = self.fpu_bsun_exception(bus, condition) {
+            return cycles;
+        }
         let value = if self.fpu_condition(condition) {
             0xFFu8
         } else {
@@ -577,6 +659,9 @@ impl CpuCore {
     pub fn exec_fdbcc<B: AddressBus>(&mut self, bus: &mut B, reg: usize, condition: u8) -> i32 {
         let disp_base = self.pc;
         let disp = self.read_imm_16(bus) as i16 as i32;
+        if let Some(cycles) = self.fpu_bsun_exception(bus, condition) {
+            return cycles;
+        }
         if !self.fpu_condition(condition) {
             let count = (self.d(reg) as u16).wrapping_sub(1);
             self.set_d(reg, (self.d(reg) & 0xFFFF_0000) | u32::from(count));
@@ -598,6 +683,9 @@ impl CpuCore {
     ) -> i32 {
         for _ in 0..imm_words {
             let _ = self.read_imm_16(bus);
+        }
+        if let Some(cycles) = self.fpu_bsun_exception(bus, condition) {
+            return cycles;
         }
         if self.fpu_condition(condition) {
             // FTRAPcc takes the TRAPcc/TRAPV exception vector (7).

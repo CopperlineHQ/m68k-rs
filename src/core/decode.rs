@@ -416,12 +416,18 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         // FBcc.W - 16-bit displacement
         let cond = (opcode & 0x3F) as u8;
         let disp = cpu.read_imm_16(bus) as i16 as i32;
+        if let Some(cycles) = cpu.fpu_bsun_exception(bus, cond) {
+            return cycles;
+        }
         return cpu.exec_fbcc(cond, disp);
     }
     if (opcode & 0xFFC0) == 0xF2C0 {
         // FBcc.L - 32-bit displacement
         let cond = (opcode & 0x3F) as u8;
         let disp = cpu.read_imm_32(bus) as i32;
+        if let Some(cycles) = cpu.fpu_bsun_exception(bus, cond) {
+            return cycles;
+        }
         return cpu.exec_fbcc(cond, disp);
     }
 
@@ -1321,9 +1327,10 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                                     // 68020/68030 coprocessor mid-instruction
                                     // frame (10 words): discard the
                                     // instruction address and the four
-                                    // internal words. This core never stacks
-                                    // it, so there is no coprocessor state
-                                    // to resume; the frame is only accepted.
+                                    // internal words. The core stacks it for
+                                    // an enabled 6888x FMOVE-out exception
+                                    // after the move has completed, so there
+                                    // is no coprocessor state to resume.
                                     let sr = cpu.pull_16(bus);
                                     cpu.pc = cpu.pull_32(bus);
                                     let _ = cpu.pull_16(bus); // format word
