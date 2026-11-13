@@ -334,7 +334,7 @@ impl CpuCore {
         Some(self.fpu_040_arith_trap(bus, cycles, w2, src.value, dst_value))
     }
 
-    /// FMOVE FPn,<ea> of a value or to a format the 68040 leaves to
+    /// `FMOVE FPn,<ea>` of a value or to a format the 68040 leaves to
     /// software: packed decimal, or a denormalized or unnormalized source
     /// in any format. A post-instruction exception through vector 55 with
     /// the format $3 frame (M68040UM 9.6.2); nothing is stored. `None` =
