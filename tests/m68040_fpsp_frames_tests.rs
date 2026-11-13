@@ -734,12 +734,24 @@ fn a_restored_exception_is_taken_by_the_next_floating_point_instruction() {
     write_busy_frame(&mut bus, E3);
     frestore(&mut cpu, &mut bus);
 
-    // Control-register moves and FMOVEM do not report it.
-    run_at(&mut cpu, &mut bus, 0x02B0, &[0xF200, 0xA800]); // FMOVE.L FPSR,D0
-    assert_eq!(cpu.pc, 0x02B4);
-    cpu.dar[10] = 0x6000;
-    run_at(&mut cpu, &mut bus, 0x02B0, &[0xF212, 0xF080]); // FMOVEM.X FP0,(A2)
-    assert_eq!(cpu.pc, 0x02B4);
+    // FSAVE and FRESTORE do not report it; every other floating-point
+    // instruction does, a control-register move and FMOVEM included,
+    // because the result of an E3 exception is not in its register (nor
+    // its status in FPSR) until the handler has run.
+    for words in [
+        [0xF200, 0xA800], // FMOVE.L FPSR,D0
+        [0xF212, 0xF080], // FMOVEM.X FP0,(A2)
+    ] {
+        let (mut cpu, mut bus) = setup(true);
+        cpu.fpcr = 0x0200;
+        cpu.fpsr = 0x0200;
+        write_busy_frame(&mut bus, E3);
+        frestore(&mut cpu, &mut bus);
+        cpu.dar[10] = 0x6000;
+        run_at(&mut cpu, &mut bus, 0x02B0, &words);
+        assert_eq!(cpu.pc, arith(49), "{words:04X?}");
+        assert_eq!(stacked(&cpu, &bus), (49 << 2, 0x02B0), "{words:04X?}");
+    }
 
     fnop(&mut cpu, &mut bus);
     assert_eq!(cpu.pc, arith(49), "INEX through vector 49");
@@ -862,7 +874,18 @@ fn enabled_arithmetic_exceptions_save_a_busy_frame() {
     cpu.fpr[1] = FloatX80::zero(false);
     cpu.fpr[0] = FloatX80::from_f64(3.0);
     run(&mut cpu, &mut bus, &[0xF200, 0x0420]); // FDIV.X FP1,FP0
+    assert_eq!(
+        cpu.pc, 0x0204,
+        "held for the next floating-point instruction"
+    );
+    assert_eq!(
+        cpu.fpr[0],
+        FloatX80::from_f64(3.0),
+        "the destination is kept"
+    );
+    fnop(&mut cpu, &mut bus);
     assert_eq!(cpu.pc, arith(50));
+    assert_eq!(stacked(&cpu, &bus), (50 << 2, 0x02A0), "pre-instruction");
     assert_eq!(fsave(&mut cpu, &mut bus), 0x4160_0000);
     assert_eq!(bus.byte_at(FRAME + E_BYTE) & (E1 | E3), E1);
     assert_eq!(bus.word_at(FRAME + CMDREG1B), 0x0420);
@@ -875,11 +898,29 @@ fn enabled_arithmetic_exceptions_save_a_busy_frame() {
     cpu.fpcr = 0x0200;
     cpu.fpr[1] = FloatX80::from_f64(3.0);
     run(&mut cpu, &mut bus, &[0xF200, 0x0420]); // 1 / 3
+    assert_eq!(
+        cpu.pc, 0x0204,
+        "held for the next floating-point instruction"
+    );
+    fnop(&mut cpu, &mut bus);
     assert_eq!(cpu.pc, arith(49));
     assert_eq!(fsave(&mut cpu, &mut bus), 0x4160_0000);
     assert_eq!(bus.byte_at(FRAME + E_BYTE) & (E1 | E3), E3);
     assert_eq!(bus.word_at(FRAME + CMDREG3B), 0x0010, "FDIV as CMDREG3B");
     assert_eq!(bus.extended_at(FRAME + WBTEMP), cpu.fpr[0]);
+
+    // FSAVE before the next floating-point instruction collects the
+    // frame, and FRESTORE of it holds the exception again.
+    let (mut cpu, mut bus) = setup(true);
+    cpu.fpcr = 0x0200;
+    cpu.fpr[1] = FloatX80::from_f64(3.0);
+    run(&mut cpu, &mut bus, &[0xF200, 0x0420]);
+    assert_eq!(fsave(&mut cpu, &mut bus), 0x4160_0000);
+    fnop(&mut cpu, &mut bus);
+    assert_eq!(cpu.pc, 0x02A4, "collected by FSAVE");
+    frestore(&mut cpu, &mut bus);
+    fnop(&mut cpu, &mut bus);
+    assert_eq!(cpu.pc, arith(49), "held again");
 }
 
 // ============================================================================

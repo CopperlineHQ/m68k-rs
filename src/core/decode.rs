@@ -377,6 +377,9 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         if fpu_disabled_060 {
             return cpu.take_fp_disabled_060(bus);
         }
+        if let Some(cycles) = cpu.fpu_take_pending_exception(bus) {
+            return cycles;
+        }
         // A 68040 exception still held in the FPU's state is taken by the
         // next conditional instruction, before it executes.
         if let Some(cycles) = cpu.fpu_040_pre_instruction(bus) {
@@ -414,8 +417,13 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
 
     // FBcc.W: 1111 0010 10cc cccc (0xF280-0xF2BF)
     // FBcc.L: 1111 0010 11cc cccc (0xF2C0-0xF2FF)
-    if (opcode & 0xFF80) == 0xF280 && fpu_disabled_060 {
-        return cpu.take_fp_disabled_060(bus);
+    if (opcode & 0xFF80) == 0xF280 {
+        if fpu_disabled_060 {
+            return cpu.take_fp_disabled_060(bus);
+        }
+        if let Some(cycles) = cpu.fpu_take_pending_exception(bus) {
+            return cycles;
+        }
     }
     // FBcc, FNOP included, likewise reports a held 68040 exception.
     if (opcode & 0xFF80) == 0xF280
@@ -1338,10 +1346,12 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                                     // 68020/68030 coprocessor mid-instruction
                                     // frame (10 words): discard the
                                     // instruction address and the four
-                                    // internal words. The core stacks it for
-                                    // an enabled 6888x FMOVE-out exception
-                                    // after the move has completed, so there
-                                    // is no coprocessor state to resume.
+                                    // internal words (for an FMOVE out, the
+                                    // destination address). The core stacks
+                                    // it for an enabled 6888x FMOVE-out
+                                    // exception after the move has completed,
+                                    // so there is no coprocessor state to
+                                    // resume.
                                     let sr = cpu.pull_16(bus);
                                     cpu.pc = cpu.pull_32(bus);
                                     let _ = cpu.pull_16(bus); // format word

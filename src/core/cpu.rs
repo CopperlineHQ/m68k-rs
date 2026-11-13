@@ -216,6 +216,15 @@ pub struct CpuCore {
     pub is_pre_68020: bool,
     /// FPU just reset
     pub fpu_just_reset: bool,
+    /// Vector (48-54) of an enabled FPU arithmetic exception that an FPU
+    /// operation raised and that has not been reported yet; 0 when none.
+    /// The FPU holds it until the next FPU instruction and reports it as
+    /// a pre-instruction exception of that instruction (MC68881/MC68882UM
+    /// 6.1 and 6.2, M68040UM 9.5, M68060UM 6.5). FSAVE and FRESTORE do
+    /// not report it: FSAVE moves it into the state frame, and FRESTORE
+    /// loads it from one.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) fpu_exception_pending: u8,
     /// Whether a floating-point unit is fitted. On the 68020/030 it says
     /// whether an external 68881/68882 is attached; when false, cpID-1
     /// F-line operations raise Line-F. The 040 models FPU absence through
@@ -470,9 +479,10 @@ pub struct CpuCore {
     /// executed. Two parts of the 68040's contract with the FPSP are not
     /// modelled with the flag false either: overflow and underflow are
     /// not trapped when disabled (the default results are computed here,
-    /// not by the FPSP), and an exception an instruction raises is taken
-    /// at that instruction's boundary rather than held pending until the
-    /// next floating-point instruction.
+    /// not by the FPSP), and the unsupported-data-type exception is taken
+    /// at the boundary of the instruction that raised it rather than held
+    /// pending until the next floating-point instruction, as enabled
+    /// arithmetic exceptions are.
     #[cfg_attr(
         feature = "serde",
         serde(default = "emulate_unimplemented_040_default")
@@ -668,6 +678,7 @@ impl CpuCore {
             // A real 6888x comes out of reset in the NULL state: FSAVE
             // writes a NULL frame until the first FPU instruction runs.
             fpu_just_reset: true,
+            fpu_exception_pending: 0,
             reset_cycles: 0,
             cyc_bcc_notake_b: -2,
             cyc_bcc_notake_w: 2,
@@ -849,6 +860,8 @@ impl CpuCore {
         self.clear_execution_pipeline_state();
         self.fpu_040.clear();
         self.stopped = 0;
+        // Reset also resets the FPU, which drops an unreported exception.
+        self.fpu_exception_pending = 0;
         self.t1_flag = 0;
         self.t0_flag = 0;
         self.m_flag = 0;

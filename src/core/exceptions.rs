@@ -898,19 +898,20 @@ impl CpuCore {
         self.exception_cycles(vector::LINE_1111)
     }
 
-    /// An enabled FPU arithmetic exception (vectors 48-54) raised by the
-    /// instruction that just completed, stacking `pc` (the next
-    /// instruction). With `mid_instruction` set it is the 6888x
-    /// mid-instruction form a 68020/68030 stacks for a coprocessor that
-    /// signals the exception during an FMOVE out: the ten-word format $9
-    /// frame with the excepting instruction's address at +$08 and four
-    /// internal words (MC68881/MC68882UM 7.4.2.6, MC68020UM 10.5.3.3).
-    /// Otherwise it is the four-word format $0 frame.
-    pub(crate) fn take_fp_arith_exception<B: AddressBus>(
+    /// An enabled exception (vectors 49-54) of a 6888x FMOVE out, which
+    /// the coprocessor signals during the instruction, after the
+    /// destination has been written. The 68020/68030 stacks the ten-word
+    /// format $9 coprocessor mid-instruction frame: the stacked PC is the
+    /// next instruction, the FMOVE's address is at +$08, and the evaluated
+    /// destination address `ea` is at +$10, where the handler finds the
+    /// operand it has to repair (MC68881/MC68882UM 6.1.3 and 7.4.2.6,
+    /// MC68020UM 10.5.3.3). `ea` is 0 for a data-register destination; the
+    /// other two internal words are not modelled and read as zero.
+    pub(crate) fn take_fp_mid_instruction_exception<B: AddressBus>(
         &mut self,
         bus: &mut B,
         vector: u32,
-        mid_instruction: bool,
+        ea: u32,
     ) -> i32 {
         if self.exception_processing {
             self.stopped = 1;
@@ -924,16 +925,38 @@ impl CpuCore {
         self.set_s_flag(SFLAG_SET);
         self.t1_flag = 0;
         self.t0_flag = 0;
-        let vec_word = (vector as u16) << 2;
-        if mid_instruction {
-            for _ in 0..4 {
-                self.push_16(bus, 0); // internal registers
-            }
-            self.push_32(bus, self.ppc); // instruction address
-            self.push_16(bus, 0x9000 | vec_word);
-        } else {
-            self.push_16(bus, vec_word);
+        self.push_32(bus, ea); // internal words at +$10: destination address
+        self.push_32(bus, 0); // internal words at +$0C
+        self.push_32(bus, self.ppc); // instruction address
+        self.push_16(bus, 0x9000 | ((vector as u16) << 2));
+        self.push_32(bus, self.pc);
+        self.push_16(bus, old_sr);
+        self.jump_vector(bus, vector);
+        self.exception_processing = false;
+        self.exception_cycles(vector)
+    }
+
+    /// A 68040 floating-point exception whose handler finishes the
+    /// instruction itself: the four-word format $0 frame with the address
+    /// of the next instruction as the stacked PC (M68040UM 9.6.2).
+    pub(crate) fn take_fp_exception_past_instruction<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        vector: u32,
+    ) -> i32 {
+        if self.exception_processing {
+            self.stopped = 1;
+            self.run_mode = RUN_MODE_BERR_AERR_RESET;
+            return 0;
         }
+        self.exception_processing = true;
+        self.internal_cycles(4);
+        let old_sr = self.get_sr();
+        self.settle_pending_trace(vector);
+        self.set_s_flag(SFLAG_SET);
+        self.t1_flag = 0;
+        self.t0_flag = 0;
+        self.push_16(bus, (vector as u16) << 2);
         self.push_32(bus, self.pc);
         self.push_16(bus, old_sr);
         self.jump_vector(bus, vector);

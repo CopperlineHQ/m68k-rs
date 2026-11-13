@@ -593,7 +593,7 @@ fn enabled_arithmetic_exceptions_trap_through_their_vectors() {
             let mut m = exc_run(cpu, &[0xF200, 0x0400 | opmode], src, dst, enable, 0);
             assert_eq!(m.vector(), Some(vector), "{cpu:?} {name}");
             let (_, pc, fv) = m.frame();
-            assert_eq!(pc, CODE + 4, "{cpu:?} {name}: PC of the next instruction");
+            assert_eq!(pc, CODE + 4, "{cpu:?} {name}: PC of the FNOP reporting it");
             assert_eq!(fv, (vector * 4) as u16, "{cpu:?} {name}: format $0");
             assert_ne!(m.cpu.fpsr & enable, 0, "{cpu:?} {name}: FPSR bit");
             assert_eq!(m.cpu.fpiar, CODE, "{cpu:?} {name}: FPIAR");
@@ -696,4 +696,254 @@ fn fscale_truncates_its_scale_factor_without_reporting_inexact() {
     let m = reg_op(CpuType::M68030, 0x26, two_point_seven, one);
     assert_eq!(bits(m.cpu.fpr[0]), (0x4001, 0x8000_0000_0000_0000));
     assert_eq!(m.cpu.fpsr, 0, "no INEX2, no accrued inexact");
+}
+
+#[test]
+fn enabled_snan_preserves_destination() {
+    let one = (0x3FFF, 0x8000_0000_0000_0000);
+    let m = exc_run(CpuType::M68030, &[0xF200, 0x0422], SNAN_X, one, 0x4000, 0);
+    assert_eq!(m.vector(), Some(54));
+    assert_eq!(bits(m.cpu.fpr[0]), one, "enabled SNAN must preserve FP0");
+}
+
+#[test]
+fn enabled_snan_operr_and_dz_leave_the_fp_registers_unchanged() {
+    // The operation stops before it stores a result, so the handler finds
+    // both operands (MC68881/MC68882UM 4.5.4.2, M68040UM 9.5, M68060UM
+    // 6.5). Disabled, the same operation stores its default result.
+    let one = (0x3FFF, 0x8000_0000_0000_0000);
+    let minus_one = (0xBFFF, 0x8000_0000_0000_0000);
+    let cases = [
+        ("SNAN", 0x22, SNAN_X, one, 0x4000, 54),     // FADD SNaN + 1
+        ("OPERR", 0x04, minus_one, one, 0x2000, 52), // FSQRT -1
+        ("DZ", 0x20, (0, 0), one, 0x0400, 50),       // FDIV 1 / 0
+    ];
+    for cpu in ALL_FPUS {
+        for (name, opmode, src, dst, enable, vector) in cases {
+            let m = exc_run(cpu, &[0xF200, 0x0400 | opmode], src, dst, enable, 0);
+            assert_eq!(m.vector(), Some(vector), "{cpu:?} {name}");
+            assert_eq!(bits(m.cpu.fpr[0]), dst, "{cpu:?} {name}: FP0 kept");
+            assert_eq!(bits(m.cpu.fpr[1]), src, "{cpu:?} {name}: FP1 kept");
+
+            let m = exc_run(cpu, &[0xF200, 0x0400 | opmode], src, dst, 0, 0);
+            assert_ne!(bits(m.cpu.fpr[0]), dst, "{cpu:?} {name} disabled: stored");
+        }
+    }
+}
+
+#[test]
+fn enabled_ovfl_unfl_and_inex_store_the_result_before_trapping() {
+    let one = (0x3FFF, 0x8000_0000_0000_0000);
+    let two = (0x4000, 0x8000_0000_0000_0000);
+    let three = (0x4000, 0xC000_0000_0000_0000);
+    let max = (0x7FFE, 0xFFFF_FFFF_FFFF_FFFF);
+    let tiny = (0x0001, 0x8000_0000_0000_0000);
+    let cases = [
+        ("OVFL", 0x23, two, max, 0x1000, 53),    // FMUL max * 2
+        ("UNFL", 0x23, tiny, tiny, 0x0800, 51),  // FMUL tiny * tiny
+        ("INEX2", 0x20, three, one, 0x0200, 49), // FDIV 1 / 3
+    ];
+    for cpu in ALL_FPUS {
+        for (name, opmode, src, dst, enable, vector) in cases {
+            let disabled = exc_run(cpu, &[0xF200, 0x0400 | opmode], src, dst, 0, 0);
+            let m = exc_run(cpu, &[0xF200, 0x0400 | opmode], src, dst, enable, 0);
+            assert_eq!(m.vector(), Some(vector), "{cpu:?} {name}");
+            assert_eq!(
+                bits(m.cpu.fpr[0]),
+                bits(disabled.cpu.fpr[0]),
+                "{cpu:?} {name}: the disabled result"
+            );
+        }
+    }
+}
+
+#[test]
+fn enabled_exception_waits_for_next_fpu_instruction() {
+    let one = (0x3FFF, 0x8000_0000_0000_0000);
+    let m = exc_run(
+        CpuType::M68030,
+        &[0xF200, 0x0422, 0x7007],
+        SNAN_X,
+        one,
+        0x4000,
+        0,
+    );
+    assert_eq!(m.vector(), Some(54));
+    assert_eq!(m.cpu.dar[0], 7, "MOVEQ between FADD and FNOP must execute");
+}
+
+#[test]
+fn pending_exception_is_a_pre_instruction_exception_of_the_next_fpu_instruction() {
+    // FADD FP1,FP0 raises the exception; MOVEQ #7,D0 runs; the next FPU
+    // instruction reports it instead of executing, with a format $0 frame
+    // that restarts it and FPIAR still naming the FADD (MC68881/MC68882UM
+    // 6.1 and 6.2, M68040UM 9.5.1, M68060UM 6.5.1).
+    let one = (0x3FFF, 0x8000_0000_0000_0000);
+    for cpu in ALL_FPUS {
+        // The next FPU instruction is FMOVE FP1,FP2, a general operation.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[1] = x80(SNAN_X.0, SNAN_X.1);
+        m.cpu.fpr[0] = x80(one.0, one.1);
+        m.cpu.fpr[2] = x80(one.0, one.1);
+        m.cpu.fpsr = 0;
+        m.cpu.fpcr = 0x4000;
+        m.run(&[0xF200, 0x0422, 0x7007, 0xF200, 0x0500]);
+        assert_eq!(m.vector(), Some(54), "{cpu:?}");
+        assert_eq!(m.cpu.dar[0], 7, "{cpu:?}: MOVEQ ran");
+        let (_, pc, fv) = m.frame();
+        assert_eq!(pc, CODE + 6, "{cpu:?}: PC restarts the FMOVE");
+        assert_eq!(fv, 54 * 4, "{cpu:?}: format $0");
+        assert_eq!(m.cpu.fpiar, CODE, "{cpu:?}: FPIAR names the FADD");
+        assert_eq!(bits(m.cpu.fpr[2]), one, "{cpu:?}: the FMOVE did not run");
+
+        // Without a following FPU instruction nothing is reported.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[1] = x80(SNAN_X.0, SNAN_X.1);
+        m.cpu.fpcr = 0x4000;
+        m.run(&[0xF200, 0x0422, 0x7007]);
+        assert_eq!(m.vector(), None, "{cpu:?}: still pending at STOP");
+        assert_ne!(m.cpu.fpsr & EXC_SNAN, 0, "{cpu:?}: FPSR records it");
+    }
+    // A conditional reports it too, here FST D1 on the 6888x and 68040.
+    for cpu in [CpuType::M68030, CpuType::M68040] {
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[1] = x80(SNAN_X.0, SNAN_X.1);
+        m.cpu.fpcr = 0x4000;
+        m.cpu.dar[1] = 0x55;
+        m.run(&[0xF200, 0x0422, 0xF241, 0x000F]);
+        assert_eq!(m.vector(), Some(54), "{cpu:?}");
+        assert_eq!(m.frame().1, CODE + 4, "{cpu:?}: PC restarts FScc");
+        assert_eq!(m.cpu.dar[1], 0x55, "{cpu:?}: FScc did not write");
+    }
+}
+
+#[test]
+fn reported_exception_is_not_reported_again() {
+    // The handler returns to the FNOP that reported the exception; it
+    // now executes. The stub handler is replaced by one that counts in
+    // D6 and returns.
+    for cpu in ALL_FPUS {
+        let mut m = Machine::new(cpu);
+        let handler = HANDLERS + 54 * 8;
+        m.bus.write_word(handler, 0x5286); // ADDQ.L #1,D6
+        m.bus.write_word(handler + 2, 0x4E73); // RTE
+        m.cpu.fpr[1] = x80(SNAN_X.0, SNAN_X.1);
+        m.cpu.fpcr = 0x4000;
+        m.cpu.dar[6] = 0;
+        m.run(&[0xF200, 0x0422, 0xF280, 0x0000, 0xF280, 0x0000]);
+        assert_eq!(m.cpu.dar[6], 1, "{cpu:?}: taken once");
+        assert_eq!(m.vector(), None, "{cpu:?}: ran to the final STOP");
+    }
+}
+
+#[test]
+fn fsave_takes_a_pending_exception_into_the_6888x_frame() {
+    const BIU_NO_EXCEPTION_PENDING: u32 = 0x0800_0000;
+    let frame_end = DATA + 0x100;
+    let biu = frame_end - 4;
+    let setup = || {
+        let mut m = Machine::new(CpuType::M68030);
+        m.cpu.fpr[1] = x80(SNAN_X.0, SNAN_X.1);
+        m.cpu.fpcr = 0x4000;
+        m.cpu.dar[8] = frame_end;
+        m
+    };
+    // FADD FP1,FP0 ; FSAVE -(A0) ; FNOP: FSAVE does not report the
+    // exception, and the FPU it leaves behind has none pending. The BIU
+    // flags of the frame record it (MC68881/MC68882UM 6.4.2).
+    let mut m = setup();
+    m.run(&[0xF200, 0x0422, 0xF320, 0xF280, 0x0000]);
+    assert_eq!(m.vector(), None, "FSAVE took it out of the FPU");
+    assert_eq!(m.bus.read_long(biu) & BIU_NO_EXCEPTION_PENDING, 0);
+
+    // With nothing pending the flag is set.
+    let mut m = setup();
+    m.cpu.fpcr = 0;
+    m.run(&[0xF200, 0x0422, 0xF320]);
+    assert_ne!(m.bus.read_long(biu) & BIU_NO_EXCEPTION_PENDING, 0);
+
+    // FRESTORE (A0)+ of the frame brings the exception back, and the
+    // next FPU instruction reports it.
+    let mut m = setup();
+    m.run(&[0xF200, 0x0422, 0xF320, 0xF358, 0xF280, 0x0000]);
+    assert_eq!(m.vector(), Some(54));
+    assert_eq!(m.frame().1, CODE + 8, "PC restarts the FNOP");
+
+    // A handler that sets the flag in the saved frame acknowledges it:
+    // BSET #3,(A0) on the first byte of the BIU flags, then FRESTORE.
+    let mut m = setup();
+    m.cpu.dar[9] = biu;
+    m.run(&[
+        0xF200, 0x0422, 0xF320, 0x08D1, 0x0003, 0xF358, 0xF280, 0x0000,
+    ]);
+    assert_eq!(m.vector(), None, "acknowledged in the frame");
+
+    // FRESTORE of a null frame resets the FPU.
+    let mut m = setup();
+    m.cpu.dar[9] = DATA; // a zero long: the null frame
+    m.run(&[0xF200, 0x0422, 0xF351, 0xF280, 0x0000]);
+    assert_eq!(m.vector(), None, "reset drops the pending exception");
+}
+
+#[test]
+fn fsave_takes_a_pending_exception_into_the_68060_excp_frame() {
+    // FADD FP1,FP0 ; FSAVE -(A0): the EXCP frame ($E0) with the vector
+    // number less 48 in bits 2:0 (M68060UM 6.7); FRESTORE of it makes the
+    // exception pending again.
+    let setup = || {
+        let mut m = Machine::new(CpuType::M68060);
+        m.cpu.fpr[1] = x80(SNAN_X.0, SNAN_X.1);
+        m.cpu.fpcr = 0x4000;
+        m.cpu.dar[8] = DATA + 0x100;
+        m
+    };
+    let mut m = setup();
+    m.run(&[0xF200, 0x0422, 0xF320, 0xF280, 0x0000]);
+    assert_eq!(m.vector(), None, "FSAVE took it out of the FPU");
+    assert_eq!(m.bus.read_long(DATA + 0x100 - 12) & 0xFFFF, 0xE006);
+
+    let mut m = setup();
+    m.run(&[0xF200, 0x0422, 0xF320, 0xF358, 0xF280, 0x0000]);
+    assert_eq!(m.vector(), Some(54));
+    assert_eq!(m.frame().1, CODE + 8, "PC restarts the FNOP");
+}
+
+#[test]
+fn move_out_exception_frame_retains_destination_address() {
+    let mut m = Machine::new(CpuType::M68030);
+    m.cpu.fpr[0] = x80(0x7FFF, 0);
+    m.cpu.fpcr = 0x2000;
+    m.cpu.dar[8] = DATA;
+    m.run(&[0xF210, 0x6000]);
+    assert_eq!(m.vector(), Some(52));
+    let sp = m.cpu.dar[15];
+    assert_eq!(
+        m.bus.read_long(sp + 0x10),
+        DATA,
+        "format 9 destination address"
+    );
+}
+
+#[test]
+fn move_out_exception_is_reported_by_the_move_itself() {
+    // The 6888x signals it during the FMOVE, after writing the
+    // destination, so no following FPU instruction is needed and the
+    // operand the handler repairs is already in memory
+    // (MC68881/MC68882UM 6.1.3 and 7.4.2.6).
+    let mut m = Machine::new(CpuType::M68030);
+    m.cpu.fpr[0] = x80(0x7FFF, 0); // +infinity
+    m.cpu.fpcr = 0x2000;
+    m.cpu.dar[8] = DATA;
+    m.bus.write_long(DATA, 0x1234_5678);
+    m.run(&[0xF210, 0x6000, 0x7007]); // FMOVE.L FP0,(A0) ; MOVEQ #7,D0
+    assert_eq!(m.vector(), Some(52));
+    assert_eq!(m.cpu.dar[0], 0, "the MOVEQ after it did not run");
+    let (_, pc, fv) = m.frame();
+    assert_eq!(fv, 0x9000 | (52 * 4), "format $9");
+    assert_eq!(pc, CODE + 4, "the next instruction");
+    assert_eq!(
+        m.bus.read_long(DATA),
+        0x7FFF_FFFF,
+        "the destination was written"
+    );
 }

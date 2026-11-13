@@ -27,11 +27,15 @@
 //! Timing model: the 68040 holds an exception of an instruction whose
 //! destination is a floating-point register pending and takes it when the
 //! next floating-point instruction is reached, stacking that instruction's
-//! address. This core takes an exception an instruction raises at that
-//! instruction's own boundary, stacking the address of the instruction that
-//! follows (as it does for the enabled arithmetic exceptions), and keeps the
-//! pending form for state loaded by FRESTORE, where the handler that
-//! restored it must be able to return first.
+//! address. Enabled arithmetic exceptions are held that way here, with
+//! their busy frame, and so is the exception of a frame loaded by
+//! FRESTORE; FSAVE collects a held exception into the frame it writes.
+//! Every floating-point instruction but FSAVE and FRESTORE reports it,
+//! FMOVEM and the control-register moves included: an E3 result is not in
+//! its register until the handler has run, and the FPSP never executes one
+//! after restoring an exception (gen_except). The unsupported-data-type
+//! exception is still taken at the boundary of the instruction that
+//! raised it, stacking the address of the instruction that follows.
 //!
 //! Not modelled: the 68040 takes overflow and underflow whether or not they
 //! are enabled, and operand error and signaling NaN on an FMOVE to an
@@ -255,7 +259,7 @@ impl CpuCore {
     /// because the handler finishes it by restoring the repaired frame.
     fn fpu_040_take_unsupp<B: AddressBus>(&mut self, bus: &mut B) -> i32 {
         self.fpiar = self.ppc;
-        self.take_fp_arith_exception(bus, vector::FP_UNSUPP_DATA_TYPE, false)
+        self.take_fp_exception_past_instruction(bus, vector::FP_UNSUPP_DATA_TYPE)
     }
 
     /// A general instruction with a memory, data-register or immediate
@@ -302,7 +306,7 @@ impl CpuCore {
         let mut flags = ExcFlags::default();
         let value = raw.to_x80(&mut flags);
         let cycles = self.fpu_apply_op(opmode, dst, value, flags);
-        Some(self.fpu_040_arith_trap(bus, cycles, w2, src.value, dst_value))
+        Some(self.fpu_040_hold_exception(cycles, w2, src.value, dst_value))
     }
 
     /// A general instruction with a register source (the command word
@@ -331,7 +335,7 @@ impl CpuCore {
 
         self.fpiar = self.ppc;
         let cycles = self.fpu_apply_op(opmode, dst, src.value, ExcFlags::default());
-        Some(self.fpu_040_arith_trap(bus, cycles, w2, src.value, dst_value))
+        Some(self.fpu_040_hold_exception(cycles, w2, src.value, dst_value))
     }
 
     /// `FMOVE FPn,<ea>` of a value or to a format the 68040 leaves to
@@ -360,29 +364,30 @@ impl CpuCore {
         Some(self.take_fp_unsupp_post_040(bus, ea))
     }
 
-    /// Report an enabled arithmetic exception of the instruction that just
-    /// completed, as [`Self::fpu_arith_trap`] does, leaving the busy frame
-    /// its handler saves: E1 with the operands for the exceptions found on
-    /// them (SNAN, OPERR, DZ), E3 with the result in WBTEMP for those found
-    /// on it (OVFL, UNFL, INEX).
-    fn fpu_040_arith_trap<B: AddressBus>(
+    /// Hold an enabled arithmetic exception of the operation that just
+    /// completed for the next floating-point instruction, with the busy
+    /// frame its handler saves: E1 with the operands for the exceptions
+    /// found on them (SNAN, OPERR, DZ), which leave the destination
+    /// register as it was, E3 with the result in WBTEMP for those found
+    /// on it (OVFL, UNFL, INEX). FSAVE before then collects the frame, and
+    /// FRESTORE of it holds the exception again.
+    fn fpu_040_hold_exception(
         &mut self,
-        bus: &mut B,
         cycles: i32,
         w2: u16,
         src: FloatX80,
         dst_before: FloatX80,
     ) -> i32 {
-        if cycles == 0 {
-            return 0;
-        }
-        match self.fpu_enabled_exception(0x7F) {
-            Some(vector) => {
-                self.fpu_040_arith_state(vector, w2, src, dst_before);
-                self.take_fp_arith_exception(bus, vector, false)
+        if cycles != 0
+            && let Some(vector) = self.fpu_enabled_exception(0x7F)
+        {
+            self.fpu_040_arith_state(vector, w2, src, dst_before);
+            if self.fpu_040.byte(off::E_BYTE) & E1 != 0 {
+                self.fpr[((w2 >> 7) & 7) as usize] = dst_before;
             }
-            None => cycles,
+            self.fpu_040.pending = true;
         }
+        cycles
     }
 
     /// The busy frame of an arithmetic exception through `vector`.
@@ -412,13 +417,23 @@ impl CpuCore {
         if self.fpu_040.is_idle() {
             return None;
         }
+        let reported = self.fpu_040_report_pending(bus);
+        if reported.is_none() {
+            self.fpu_040.clear();
+        }
+        reported
+    }
+
+    /// Take the exception the FPU's state still carries, if any, as a
+    /// pre-instruction exception of the instruction now starting. The
+    /// state stays for the handler's FSAVE.
+    pub(crate) fn fpu_040_report_pending<B: AddressBus>(&mut self, bus: &mut B) -> Option<i32> {
         if self.fpu_040.pending
             && let Some(vector) = self.fpu_040_pending_vector()
         {
             self.fpu_040.pending = false;
             return Some(self.take_exception(bus, vector));
         }
-        self.fpu_040.clear();
         None
     }
 
