@@ -22,13 +22,43 @@ const FPCR_IMPLEMENTED: u32 = 0x0000_FFF0;
 const FPSR_IMPLEMENTED: u32 = 0x0FFF_FFF8;
 
 /// Where a resolved FPU operand lives.
-enum FpuEa {
+pub(super) enum FpuEa {
     /// Data register (formats of 4 bytes or fewer only).
     DataReg(usize),
     /// Memory address.
     Memory(u32),
     /// Immediate data, to be consumed from the instruction stream.
     Immediate,
+}
+
+/// A source operand as fetched, before conversion to extended.
+#[derive(Clone, Copy)]
+pub(super) enum RawSource {
+    Long(u32),
+    Word(u16),
+    Byte(u8),
+    Single(u32),
+    Double(u64),
+    /// Sign and exponent word, mantissa.
+    Extended(u16, u64),
+    /// The three longs of a packed decimal real.
+    Packed([u32; 3]),
+}
+
+impl RawSource {
+    /// Widen to extended, raising the exceptions of the conversion: SNAN
+    /// for a single or double signaling NaN, INEX1 for packed decimal.
+    pub(super) fn to_x80(self, f: &mut ExcFlags) -> FloatX80 {
+        match self {
+            RawSource::Long(v) => FloatX80::from_f64(v as i32 as f64),
+            RawSource::Word(v) => FloatX80::from_f64(v as i16 as f64),
+            RawSource::Byte(v) => FloatX80::from_f64(v as i8 as f64),
+            RawSource::Single(v) => single_to_x80(v, f),
+            RawSource::Double(v) => double_to_x80(v, f),
+            RawSource::Extended(exp_word, mantissa) => FloatX80::from_extended(exp_word, mantissa),
+            RawSource::Packed(w) => packed::from_packed(words_to_bytes(w[0], w[1], w[2]), f),
+        }
+    }
 }
 
 /// The FP opmodes the 68060 dropped from silicon, emulated by the 68060SP:
@@ -71,7 +101,7 @@ fn fpu_060_traps_opmode(opmode: u16) -> bool {
 /// among the 68040's native instructions. FMOVECR is gated separately by
 /// encoding. FSGLMUL/FSGLDIV and every rounded (FS/FD-prefixed) variant are in
 /// hardware.
-fn fpu_040_traps_opmode(opmode: u16) -> bool {
+pub(super) fn fpu_040_traps_opmode(opmode: u16) -> bool {
     matches!(opmode, 0x01 | 0x03) || fpu_060_traps_opmode(opmode)
 }
 
@@ -172,6 +202,16 @@ impl CpuCore {
         // its reset NULL state (FSAVE then produces a real frame).
         self.fpu_just_reset = false;
 
+        // A 68040 exception still held in the FPU's state is taken by the
+        // next arithmetic or FMOVE instruction, before it executes. The
+        // control-register moves and FMOVEM do not report it.
+        if !self.fpu_040.is_idle()
+            && matches!(subop, 0x0 | 0x2 | 0x3)
+            && let Some(cycles) = self.fpu_040_pre_instruction(bus)
+        {
+            return cycles;
+        }
+
         match subop {
             0x2 => {
                 // FPU ALU <ea>, FPn -- the memory/immediate-source form of
@@ -204,7 +244,7 @@ impl CpuCore {
                             return self
                                 .take_exception(bus, crate::core::exceptions::vector::LINE_1111);
                         }
-                        return self.take_fp_unimp_060(bus, 0);
+                        return self.fpu_040_fmovecr_trap(bus, w2);
                     }
                     // FMOVECR - load constant from ROM. The opmode field is
                     // the ROM index; there is no <ea> source operand.
@@ -235,21 +275,12 @@ impl CpuCore {
                     return self.take_exception(bus, vector);
                 }
 
-                if self.trap_unimpl_040() {
-                    if fpu_040_traps_opmode(opmode) {
-                        // Takes precedence over a packed source (M68040UM
-                        // 9.6.1); the handler detects that data type.
-                        let ea = self.fpu_060_trap_ea(bus, opcode, src_fmt);
-                        return self.take_fp_unimp_060(bus, ea);
-                    }
-                    if src_fmt == 3 {
-                        // Pre-instruction format $0 frame: the stacked PC
-                        // restarts the instruction (M68040UM 9.6.2).
-                        return self.take_exception(
-                            bus,
-                            crate::core::exceptions::vector::FP_UNSUPP_DATA_TYPE,
-                        );
-                    }
+                // 68040 with traps: the instructions and data types left to
+                // the M68040FPSP, and the state frames its handlers save.
+                if self.trap_unimpl_040()
+                    && let Some(cycles) = self.fpu_040_ea_source(bus, opcode, w2)
+                {
+                    return cycles;
                 }
 
                 self.fpiar = self.ppc;
@@ -271,10 +302,10 @@ impl CpuCore {
                         .take_exception(bus, crate::core::exceptions::vector::FP_UNSUPP_DATA_TYPE);
                 }
 
-                if self.trap_unimpl_040() && (dst_fmt == 3 || dst_fmt == 7) {
-                    let _w2 = self.read_imm_16(bus);
-                    let ea = self.fpu_060_trap_ea(bus, opcode, 3);
-                    return self.take_fp_unsupp_post_040(bus, ea);
+                if self.trap_unimpl_040()
+                    && let Some(cycles) = self.fpu_040_move_out(bus, opcode, w2)
+                {
+                    return cycles;
                 }
 
                 // Packed-decimal k-factor: static (fmt 3) in w2 bits 6-0;
@@ -322,8 +353,11 @@ impl CpuCore {
 
                 if opmode == 0x17 {
                     // FMOVECR was dropped from 68060 silicon.
-                    if self.trap_unimpl_060() || self.trap_unimpl_040() {
+                    if self.trap_unimpl_060() {
                         return self.take_fp_unimp_060(bus, 0);
+                    }
+                    if self.trap_unimpl_040() {
+                        return self.fpu_040_fmovecr_trap(bus, w2);
                     }
                     // FMOVECR - load constant from ROM. In this register-form
                     // encoding the source-register field carries the ROM index.
@@ -340,8 +374,10 @@ impl CpuCore {
                     // instruction: no operand EA.
                     return self.take_fp_unimp_060(bus, 0);
                 }
-                if self.trap_unimpl_040() && fpu_040_traps_opmode(opmode) {
-                    return self.take_fp_unimp_060(bus, 0);
+                if self.trap_unimpl_040()
+                    && let Some(cycles) = self.fpu_040_register_source(bus, w2)
+                {
+                    return cycles;
                 }
                 self.fpiar = self.ppc;
                 let cycles = self.fpu_apply_op(opmode, dst, self.fpr[src], ExcFlags::default());
@@ -548,7 +584,7 @@ impl CpuCore {
     /// as its vector: BSUN, SNAN, OPERR, OVFL, UNFL, DZ, then INEX2/INEX1
     /// sharing vector 49 (MC68881/MC68882UM 6.1 and table 6-2, M68040UM
     /// 9.5, M68060UM 6.5).
-    fn fpu_enabled_exception(&self, mask: u32) -> Option<u32> {
+    pub(super) fn fpu_enabled_exception(&self, mask: u32) -> Option<u32> {
         use crate::core::exceptions::vector;
         let pending = (self.fpsr >> 8) & (self.fpcr >> 8) & mask;
         [
@@ -733,7 +769,7 @@ impl CpuCore {
     /// and immediate modes are not control modes; the callers keep their
     /// own arms for the increment/decrement forms and everything else is
     /// an undefined encoding (None -> Line-F).
-    fn fpu_frame_control_ea<B: AddressBus>(
+    pub(super) fn fpu_frame_control_ea<B: AddressBus>(
         &mut self,
         bus: &mut B,
         ea_mode: u8,
@@ -765,6 +801,9 @@ impl CpuCore {
     fn exec_fsave<B: AddressBus>(&mut self, bus: &mut B, ea_mode: u8, ea_reg: usize) -> i32 {
         if self.is_060() {
             return self.exec_fsave_060(bus, ea_mode, ea_reg);
+        }
+        if !self.fpu_040.is_idle() {
+            return self.fpu_040_fsave(bus, ea_mode, ea_reg);
         }
         match ea_mode {
             3 => {
@@ -941,6 +980,7 @@ impl CpuCore {
                 self.set_a(ea_reg, addr.wrapping_add(4));
             }
             self.do_frestore_null();
+            self.fpu_040.clear();
             return 8;
         }
         if !self.fpu_frame_header_valid(header) {
@@ -954,6 +994,9 @@ impl CpuCore {
             // long; the postincrement covers header plus state.
             let size = (header >> 16) & 0x00FF;
             self.set_a(ea_reg, addr.wrapping_add(4 + size));
+        }
+        if self.trap_unimpl_040() {
+            self.fpu_040_frestore(bus, addr, header);
         }
         8
     }
@@ -1118,7 +1161,13 @@ impl CpuCore {
     /// transcendental engines. The 6888x single/double
     /// rounding-precision variants (FSxxx/FDxxx) select their specified
     /// result precision before the value is written back.
-    fn fpu_apply_op(&mut self, opmode: u16, dst: usize, src: FloatX80, src_flags: ExcFlags) -> i32 {
+    pub(super) fn fpu_apply_op(
+        &mut self,
+        opmode: u16,
+        dst: usize,
+        src: FloatX80,
+        src_flags: ExcFlags,
+    ) -> i32 {
         // Operands that are zeros with a nonzero exponent field compute as
         // zeros. FCMP and FTST do not write the destination register.
         let src = canonical_zero(src);
@@ -1389,7 +1438,12 @@ impl CpuCore {
     /// pre-decrement commit, matching the calculated-EA semantics of the
     /// format $2 frame. Returns the EA long for the frame (0 when the
     /// operand is not in memory).
-    fn fpu_060_trap_ea<B: AddressBus>(&mut self, bus: &mut B, opcode: u16, fmt: u16) -> u32 {
+    pub(super) fn fpu_060_trap_ea<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        opcode: u16,
+        fmt: u16,
+    ) -> u32 {
         let ea_mode = ((opcode >> 3) & 7) as u8;
         let ea_reg = (opcode & 7) as usize;
         let bytes: u32 = match fmt {
@@ -1473,6 +1527,21 @@ impl CpuCore {
         opcode: u16,
         fmt: u16,
     ) -> Option<(FloatX80, ExcFlags)> {
+        let (raw, _) = self.fpu_fetch_source(bus, opcode, fmt)?;
+        let mut f = ExcFlags::default();
+        let value = raw.to_x80(&mut f);
+        Some((value, f))
+    }
+
+    /// Fetch the source operand in `fmt` as it is stored, before any
+    /// conversion, with its memory address (0 for a data register or an
+    /// immediate).
+    pub(super) fn fpu_fetch_source<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        opcode: u16,
+        fmt: u16,
+    ) -> Option<(RawSource, u32)> {
         let ea_mode = ((opcode >> 3) & 7) as u8;
         let ea_reg = (opcode & 7) as usize;
         let bytes: u32 = match fmt {
@@ -1483,68 +1552,74 @@ impl CpuCore {
             2 | 3 => 12, // extended and packed-decimal are 12 bytes
             _ => return None,
         };
-        let mut f = ExcFlags::default();
-        let value = match self.fpu_ea(bus, ea_mode, ea_reg, bytes)? {
+        let fetched = match self.fpu_ea(bus, ea_mode, ea_reg, bytes)? {
             FpuEa::DataReg(r) => {
                 let v = self.d(r);
-                match fmt {
-                    0 => FloatX80::from_f64(v as i32 as f64),
-                    1 => single_to_x80(v, &mut f),
-                    4 => FloatX80::from_f64(v as u16 as i16 as f64),
-                    6 => FloatX80::from_f64(v as u8 as i8 as f64),
+                let raw = match fmt {
+                    0 => RawSource::Long(v),
+                    1 => RawSource::Single(v),
+                    4 => RawSource::Word(v as u16),
+                    6 => RawSource::Byte(v as u8),
                     _ => return None, // 8/12-byte operands cannot live in Dn
-                }
+                };
+                (raw, 0)
             }
-            FpuEa::Immediate => match fmt {
-                0 => FloatX80::from_f64(self.read_imm_32(bus) as i32 as f64),
-                1 => single_to_x80(self.read_imm_32(bus), &mut f),
-                4 => FloatX80::from_f64(self.read_imm_16(bus) as i16 as f64),
-                6 => FloatX80::from_f64((self.read_imm_16(bus) & 0xFF) as u8 as i8 as f64),
-                5 => {
-                    let hi = self.read_imm_32(bus) as u64;
-                    let lo = self.read_imm_32(bus) as u64;
-                    double_to_x80((hi << 32) | lo, &mut f)
-                }
-                2 => {
-                    let exp_word = (self.read_imm_32(bus) >> 16) as u16;
-                    let hi = self.read_imm_32(bus) as u64;
-                    let lo = self.read_imm_32(bus) as u64;
-                    FloatX80::from_extended(exp_word, (hi << 32) | lo)
-                }
-                3 => {
-                    let w0 = self.read_imm_32(bus);
-                    let w1 = self.read_imm_32(bus);
-                    let w2 = self.read_imm_32(bus);
-                    packed::from_packed(words_to_bytes(w0, w1, w2), &mut f)
-                }
-                _ => return None,
-            },
-            FpuEa::Memory(addr) => match fmt {
-                0 => FloatX80::from_f64(self.read_32(bus, addr) as i32 as f64),
-                1 => single_to_x80(self.read_32(bus, addr), &mut f),
-                4 => FloatX80::from_f64(self.read_16(bus, addr) as i16 as f64),
-                6 => FloatX80::from_f64(self.read_8(bus, addr) as i8 as f64),
-                5 => {
-                    let hi = self.read_32(bus, addr) as u64;
-                    let lo = self.read_32(bus, addr.wrapping_add(4)) as u64;
-                    double_to_x80((hi << 32) | lo, &mut f)
-                }
-                2 => {
-                    let exp_word = self.read_16(bus, addr);
-                    let hi = self.read_32(bus, addr.wrapping_add(4)) as u64;
-                    let lo = self.read_32(bus, addr.wrapping_add(8)) as u64;
-                    FloatX80::from_extended(exp_word, (hi << 32) | lo)
-                }
-                3 => {
-                    let w0 = self.read_32(bus, addr);
-                    let w1 = self.read_32(bus, addr.wrapping_add(4));
-                    let w2 = self.read_32(bus, addr.wrapping_add(8));
-                    packed::from_packed(words_to_bytes(w0, w1, w2), &mut f)
-                }
-                _ => return None,
-            },
+            FpuEa::Immediate => {
+                let raw = match fmt {
+                    0 => RawSource::Long(self.read_imm_32(bus)),
+                    1 => RawSource::Single(self.read_imm_32(bus)),
+                    4 => RawSource::Word(self.read_imm_16(bus)),
+                    6 => RawSource::Byte((self.read_imm_16(bus) & 0xFF) as u8),
+                    5 => {
+                        let hi = self.read_imm_32(bus) as u64;
+                        let lo = self.read_imm_32(bus) as u64;
+                        RawSource::Double((hi << 32) | lo)
+                    }
+                    2 => {
+                        let exp_word = (self.read_imm_32(bus) >> 16) as u16;
+                        let hi = self.read_imm_32(bus) as u64;
+                        let lo = self.read_imm_32(bus) as u64;
+                        RawSource::Extended(exp_word, (hi << 32) | lo)
+                    }
+                    3 => {
+                        let w0 = self.read_imm_32(bus);
+                        let w1 = self.read_imm_32(bus);
+                        let w2 = self.read_imm_32(bus);
+                        RawSource::Packed([w0, w1, w2])
+                    }
+                    _ => return None,
+                };
+                (raw, 0)
+            }
+            FpuEa::Memory(addr) => {
+                let raw = match fmt {
+                    0 => RawSource::Long(self.read_32(bus, addr)),
+                    1 => RawSource::Single(self.read_32(bus, addr)),
+                    4 => RawSource::Word(self.read_16(bus, addr)),
+                    6 => RawSource::Byte(self.read_8(bus, addr)),
+                    5 => {
+                        let hi = self.read_32(bus, addr) as u64;
+                        let lo = self.read_32(bus, addr.wrapping_add(4)) as u64;
+                        RawSource::Double((hi << 32) | lo)
+                    }
+                    2 => {
+                        let exp_word = self.read_16(bus, addr);
+                        let hi = self.read_32(bus, addr.wrapping_add(4)) as u64;
+                        let lo = self.read_32(bus, addr.wrapping_add(8)) as u64;
+                        RawSource::Extended(exp_word, (hi << 32) | lo)
+                    }
+                    3 => {
+                        let w0 = self.read_32(bus, addr);
+                        let w1 = self.read_32(bus, addr.wrapping_add(4));
+                        let w2 = self.read_32(bus, addr.wrapping_add(8));
+                        RawSource::Packed([w0, w1, w2])
+                    }
+                    _ => return None,
+                };
+                (raw, addr)
+            }
         };
-        Some((value, f))
+        Some(fetched)
     }
 
     /// Write `value` to the FMOVE destination in `fmt`. Integer formats

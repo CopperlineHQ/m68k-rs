@@ -443,17 +443,43 @@ pub struct CpuCore {
     /// OS-side 68060 software package. False = faithful traps.
     pub emulate_unimplemented_060: bool,
 
-    /// 68040 escape hatch: execute the FPU instructions and packed-decimal
-    /// operands the 040 leaves to its floating-point software package
-    /// natively instead of trapping. True by default, unlike the 060 flag,
-    /// because FSAVE does not yet produce the 040 unimplemented-instruction
-    /// state frame that the M68040FPSP reads. False = faithful traps, for a
-    /// host that supplies its own handler or wants the guest to see the trap.
+    /// 68040 escape hatch: execute the FPU instructions and data types the
+    /// 040 leaves to its floating-point software package (the M68040FPSP;
+    /// 68040.library on AmigaOS) natively instead of trapping.
+    ///
+    /// False = faithful traps on a 68040 with its FPU: the transcendental
+    /// instructions, FMOVECR, FINT/FINTRZ and the rest of M68040UM table
+    /// 9-10 take the Line-F vector with the format $2 frame; packed
+    /// decimal, and denormalized or unnormalized operands of the hardware
+    /// instructions, take the unsupported-data-type vector 55. FSAVE then
+    /// gives the handler the unimplemented-instruction or busy state
+    /// frame, and FRESTORE completes an instruction the handler repaired
+    /// and carries a frame's pending exception to the next floating-point
+    /// instruction (see [`Self::fpu_040`]). The 68LC040 and 68EC040 have
+    /// no FPU and are not affected.
+    ///
+    /// True by default, unlike the 060 flag: a 68040 guest without the
+    /// FPSP installed could not otherwise use those instructions or any
+    /// denormalized operand, which earlier versions of this crate
+    /// executed. Two parts of the 68040's contract with the FPSP are not
+    /// modelled with the flag false either: overflow and underflow are
+    /// not trapped when disabled (the default results are computed here,
+    /// not by the FPSP), and an exception an instruction raises is taken
+    /// at that instruction's boundary rather than held pending until the
+    /// next floating-point instruction.
     #[cfg_attr(
         feature = "serde",
         serde(default = "emulate_unimplemented_040_default")
     )]
     pub emulate_unimplemented_040: bool,
+
+    /// The 68040 FPU's exceptional state with
+    /// [`Self::emulate_unimplemented_040`] false: what FSAVE writes as an
+    /// unimplemented-instruction ($4130) or busy ($4160) state frame after
+    /// a floating-point exception, and the pending exception a frame
+    /// loaded by FRESTORE carries. Idle otherwise.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub fpu_040: crate::fpu::Fpu040State,
 
     /// When enabled, use SingleStepTests/MAME-derived semantics for a few edge cases where
     /// Musashi and MAME fixtures intentionally differ (notably BCD "invalid digit" behavior and
@@ -677,6 +703,7 @@ impl CpuCore {
             oep060: Default::default(),
             emulate_unimplemented_060: false,
             emulate_unimplemented_040: emulate_unimplemented_040_default(),
+            fpu_040: crate::fpu::Fpu040State::default(),
             sst_m68000_compat: false,
             fpu_present: true,
         };
@@ -813,6 +840,7 @@ impl CpuCore {
     /// Pulse reset (initialize CPU state without loading vectors).
     pub fn pulse_reset(&mut self) {
         self.clear_execution_pipeline_state();
+        self.fpu_040.clear();
         self.stopped = 0;
         self.t1_flag = 0;
         self.t0_flag = 0;
