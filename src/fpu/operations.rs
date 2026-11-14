@@ -99,6 +99,13 @@ fn canonical_zero(v: FloatX80) -> FloatX80 {
     }
 }
 
+/// Whether `v` is a denormalized number: nonzero, with a zero exponent
+/// field and the integer bit clear. Such a result is an underflow whether
+/// or not it is exact (MC68881/MC68882UM 6.1.5).
+fn is_denormalized(v: FloatX80) -> bool {
+    v.biased_exp() == 0 && v.mantissa != 0 && v.mantissa >> 63 == 0
+}
+
 /// Sign-extend a 7-bit FMOVE k-factor to i8.
 fn sign_extend7(v: u16) -> i8 {
     let raw = (v & 0x7F) as i16;
@@ -1377,6 +1384,9 @@ impl CpuCore {
                 // FMOD - exact remainder, truncated quotient.
                 let mut f = src_flags;
                 let rem = transcendental::remainder(self.fpr[dst], src, false, &mut f);
+                if is_denormalized(rem.value) {
+                    f.raise(ExcFlags::UNFL);
+                }
                 self.fpr[dst] = rem.value;
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_set_quotient(rem.quotient, rem.quotient_sign);
@@ -1387,6 +1397,9 @@ impl CpuCore {
                 // FREM - exact IEEE remainder, round-to-nearest quotient.
                 let mut f = src_flags;
                 let rem = transcendental::remainder(self.fpr[dst], src, true, &mut f);
+                if is_denormalized(rem.value) {
+                    f.raise(ExcFlags::UNFL);
+                }
                 self.fpr[dst] = rem.value;
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_set_quotient(rem.quotient, rem.quotient_sign);
@@ -1742,6 +1755,12 @@ impl CpuCore {
                     } else {
                         value
                     };
+                    // A denormalized number is below the normalized range
+                    // of this format as of the others: an underflow, exact
+                    // as it is (MC68881/MC68882UM 6.1.5).
+                    if is_denormalized(value) {
+                        f.raise(ExcFlags::UNFL);
+                    }
                     let (exp_word, mantissa) = value.to_extended();
                     self.write_32(bus, addr, (exp_word as u32) << 16);
                     self.write_32(bus, addr.wrapping_add(4), (mantissa >> 32) as u32);
