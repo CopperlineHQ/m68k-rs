@@ -1551,8 +1551,9 @@ impl CpuCore {
                     true
                 }
                 3 | 7 => {
-                    // Packed decimal (static or dynamic k-factor).
-                    let bytes = packed::to_packed(value, kfactor, &mut f);
+                    // Packed decimal (static or dynamic k-factor), cut to
+                    // its digits by the FPCR rounding mode.
+                    let bytes = packed::to_packed(value, kfactor, mode, &mut f);
                     for (i, chunk) in bytes.chunks(4).enumerate() {
                         let w = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                         self.write_32(bus, addr.wrapping_add(4 * i as u32), w);

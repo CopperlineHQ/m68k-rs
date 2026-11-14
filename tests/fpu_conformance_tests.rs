@@ -54,6 +54,7 @@ const CC_NAN: u32 = 0x0100_0000;
 /// FPSR exception-status bits.
 const EXC_BSUN: u32 = 0x8000;
 const EXC_SNAN: u32 = 0x4000;
+const EXC_OPERR: u32 = 0x2000;
 /// FPSR accrued-exception bits.
 const AEXC_IOP: u32 = 0x0080;
 const AEXC_INEX: u32 = 0x0008;
@@ -414,6 +415,67 @@ fn packed_decimal_conversions_report_inexact() {
         m.run(&[0xF210, 0x6C06]);
         assert_eq!(m.bus.read_long(DATA + 4), 0x2345_6000, "{cpu:?}");
         assert_eq!(m.cpu.fpsr, 0, "{cpu:?} exact out");
+    }
+}
+
+#[test]
+fn packed_decimal_move_out_follows_the_rounding_mode_and_the_operand() {
+    for cpu in [CpuType::M68030, CpuType::M68040] {
+        // FMOVE.P FP0,(A0){#3} of 123456 in each rounding mode: only
+        // toward plus infinity is it 1.24E5.
+        for (fpcr, digits) in [
+            (0x00, 0x2300_0000),
+            (0x10, 0x2300_0000),
+            (0x20, 0x2300_0000),
+            (0x30, 0x2400_0000),
+        ] {
+            let mut m = Machine::new(cpu);
+            m.cpu.fpcr = fpcr;
+            m.cpu.fpr[0] = x80(0x400F, 0xF120_0000_0000_0000);
+            m.cpu.dar[8] = DATA;
+            m.run(&[0xF210, 0x6C03]);
+            assert_eq!(m.bus.read_long(DATA), 0x0005_0001, "{cpu:?} {fpcr:#x}");
+            assert_eq!(m.bus.read_long(DATA + 4), digits, "{cpu:?} {fpcr:#x}");
+            assert_eq!(m.cpu.fpsr, EXC_INEX2 | AEXC_INEX, "{cpu:?} {fpcr:#x}");
+        }
+
+        // An infinity is stored as its extended image, which is the
+        // packed infinity: SE and both y bits over the exponent $FFF.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(0xFFFF, 0);
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x6C03]);
+        assert_eq!(m.bus.read_long(DATA), 0xFFFF_0000, "{cpu:?}");
+        assert_eq!(m.bus.read_long(DATA + 4), 0, "{cpu:?}");
+        assert_eq!(m.cpu.fpsr, 0, "{cpu:?} infinity");
+
+        // The largest number has a four-digit decimal exponent: its
+        // thousands digit is in bits 15-12 and OPERR is raised.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(0x7FFE, 0xFFFF_FFFF_FFFF_FFFF);
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x6C03]);
+        assert_eq!(m.bus.read_long(DATA), 0x0932_4001, "{cpu:?}");
+        assert_eq!(m.bus.read_long(DATA + 4), 0x1900_0000, "{cpu:?}");
+        assert_eq!(
+            m.cpu.fpsr,
+            EXC_OPERR | EXC_INEX2 | AEXC_IOP | AEXC_INEX,
+            "{cpu:?} huge"
+        );
+
+        // A dynamic k-factor of zero in D1: 0.1 to no decimal places.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(0x3FFB, 0xCCCC_CCCC_CCCC_CCCD);
+        m.cpu.dar[8] = DATA;
+        m.cpu.dar[1] = 0xFFFF_FF80;
+        m.bus.write_long(DATA, 0xAAAA_AAAA);
+        m.bus.write_long(DATA + 4, 0xAAAA_AAAA);
+        m.bus.write_long(DATA + 8, 0xAAAA_AAAA);
+        m.run(&[0xF210, 0x7C10]);
+        assert_eq!(m.bus.read_long(DATA), 0, "{cpu:?}");
+        assert_eq!(m.bus.read_long(DATA + 4), 0, "{cpu:?}");
+        assert_eq!(m.bus.read_long(DATA + 8), 0, "{cpu:?}");
+        assert_eq!(m.cpu.fpsr, EXC_INEX2 | AEXC_INEX, "{cpu:?} k = 0");
     }
 }
 
