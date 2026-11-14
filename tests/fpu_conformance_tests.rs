@@ -618,6 +618,27 @@ fn an_overflow_sets_inex2_only_for_a_rounded_mantissa() {
     }
 }
 
+#[test]
+fn an_unnormalized_register_is_stored_normalized() {
+    // MC68881/MC68882UM 3.5.2: a move out never produces an unnormalized
+    // number. FMOVEM, which does not convert, is how one gets in.
+    for cpu in [CpuType::M68030, CpuType::M68040] {
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(0xC002, 0x0123_4567_89AB_CDEF);
+        m.cpu.dar[8] = DATA;
+        // FMOVE.X FP0,(A0)
+        m.run(&[0xF210, 0x6800]);
+        assert_eq!(m.bus.read_long(DATA), 0xBFFB_0000, "{cpu:?}");
+        assert_eq!(m.bus.read_long(DATA + 4), 0x91A2_B3C4, "{cpu:?}");
+        assert_eq!(m.bus.read_long(DATA + 8), 0xD5E6_F780, "{cpu:?}");
+        assert_eq!(m.cpu.fpsr & 0xFFFF, 0, "{cpu:?}");
+        // FMOVEM.X FP0,(A0) stores the register as it is.
+        m.run(&[0xF210, 0xF080]);
+        assert_eq!(m.bus.read_long(DATA), 0xC002_0000, "{cpu:?}");
+        assert_eq!(m.bus.read_long(DATA + 4), 0x0123_4567, "{cpu:?}");
+    }
+}
+
 /// A conditional instruction's encoding for a predicate.
 type PredicateForm = (&'static str, fn(u16) -> Vec<u16>);
 

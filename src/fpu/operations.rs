@@ -88,14 +88,29 @@ fn sgl_truncate(v: FloatX80) -> FloatX80 {
     }
 }
 
+/// An extended-precision operand as the FPU computes with it.
+///
 /// A zero mantissa is a zero whatever the exponent field holds (see
-/// [`FloatX80::is_zero`]); give such an operand the zero exponent the
-/// arithmetic returns and stores.
-fn canonical_zero(v: FloatX80) -> FloatX80 {
-    if v.is_zero() {
+/// [`FloatX80::is_zero`]) and gets the zero exponent the arithmetic
+/// returns and stores. An unnormalized number, one with a nonzero
+/// exponent field and the integer bit clear, is normalized first
+/// (MC68881/MC68882UM 3.5.1; the 68040's and 68060's packages do the same
+/// for the part): its mantissa is shifted up and the exponent brought
+/// down with it, as far as a zero exponent, where it is a denormalized
+/// number. FMOVEM loads registers without conversion, so a register can
+/// hold either.
+fn canonical_operand(v: FloatX80) -> FloatX80 {
+    let exp = v.biased_exp();
+    if exp == 0x7FFF {
+        v
+    } else if v.mantissa == 0 {
         FloatX80::zero(v.sign())
     } else {
-        v
+        let shift = v.mantissa.leading_zeros().min(u32::from(exp));
+        FloatX80 {
+            sign_exp: v.sign_exp - shift as u16,
+            mantissa: v.mantissa << shift,
+        }
     }
 }
 
@@ -1205,10 +1220,11 @@ impl CpuCore {
     /// result precision before the value is written back.
     fn fpu_apply_op(&mut self, opmode: u16, dst: usize, src: FloatX80, src_flags: ExcFlags) -> i32 {
         // Operands that are zeros with a nonzero exponent field compute as
-        // zeros. FCMP and FTST do not write the destination register.
-        let src = canonical_zero(src);
+        // zeros, and unnormalized ones as the normalized number they
+        // hold. FCMP and FTST do not write the destination register.
+        let src = canonical_operand(src);
         if !matches!(opmode, 0x38 | 0x3A) {
-            self.fpr[dst] = canonical_zero(self.fpr[dst]);
+            self.fpr[dst] = canonical_operand(self.fpr[dst]);
         }
         match opmode {
             0x00 | 0x40 | 0x44 => {
@@ -1341,7 +1357,7 @@ impl CpuCore {
             0x38 => {
                 // FCMP - ordered compare of dst with src, set condition codes only
                 let mut f = src_flags;
-                let d = canonical_zero(self.fpr[dst]);
+                let d = canonical_operand(self.fpr[dst]);
                 let cmp = softfloat::compare(d, src, &mut f);
                 self.fpu_set_cc_cmp(cmp);
                 // Two equal infinities compare equal with the infinity's
@@ -1683,7 +1699,7 @@ impl CpuCore {
             FpuEa::Memory(addr) => addr,
             _ => 0,
         };
-        let value = canonical_zero(value);
+        let value = canonical_operand(value);
         // Integer, single and double results are rounded once, straight
         // from the extended value, by the FPCR rounding mode, and report
         // their exceptions in FPSR like an arithmetic result.
