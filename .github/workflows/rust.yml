@@ -70,6 +70,9 @@ jobs:
       - name: Run tests (JIT without profiling)
         run: cargo test --features jit --lib --locked
 
+      - name: Verify the default JIT poll policy
+        run: cargo test --features jit,trace-profile --lib --locked wait
+
       - name: Run tests (all features)
         run: cargo test --all-features --locked
 

@@ -43,6 +43,8 @@
 //! - `jit` lowers eligible hot traces to native code with Cranelift on
 //!   non-WebAssembly targets. Without it—and on WebAssembly—the same trace
 //!   machinery uses the portable Rust executor.
+//! - `jit-poll-loops` lets the native JIT compile pure memory polls for hosts
+//!   that advance emulated devices between bounded CPU runs.
 //! - `trace-profile` adds opt-in trace and decoded-operation profiling,
 //!   activated at runtime with `M68K_TRACE_PROFILE=1`.
 //!

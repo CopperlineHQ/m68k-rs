@@ -38,6 +38,14 @@ The default build has no JIT compiler dependency. Native applications that use
 m68k = { version = "0.14.3", features = ["jit"] }
 ```
 
+A machine emulator that advances its devices between bounded CPU runs can
+enable `jit-poll-loops` in place of `jit`. On native targets the trace
+compiler then admits loops that compare or test memory and branch back to
+wait for a change. These loops use the ordinary instruction budget, code
+validation and direct-memory guards. The next batch rereads the operand
+after the emulator has serviced its devices. The default `jit` policy keeps
+pure polls interpreted for hosts waiting on wall-clock input.
+
 With `jit` enabled on x86-64, eligible indirect-dispatch loops and short
 return arms are combined in the background by default, including on Windows,
 Linux and Intel macOS. Set `M68K_NATIVE_REGIONS=off` before starting the process

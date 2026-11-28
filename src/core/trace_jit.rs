@@ -3827,20 +3827,15 @@ impl TraceJit {
             return Err(RegionRejectReason::LinearMemoryAlu);
         }
 
-        // A pure poll loop burns wall time by design: its exit depends only
-        // on memory it never writes, so executing it faster cannot make it
-        // exit sooner. It is also exactly the class no trap-anchored wait
-        // detector can see. Compiling it as a native spin multiplies the
-        // instructions burned per wall second while the guest waits, so
-        // refuse the compilation and leave the loop on the decoded path.
-        //
-        // This requires the recording to have actually gone round, not
-        // merely to end in a branch whose static target is the head.
-        // `self_loop` is true for a fall-through path as well, and a
-        // recording that fell through to an unsupported operation is a
-        // different shape entirely: reporting it as a wait would remove a
-        // real blocker from the opportunity ranking.
-        if recorded_exit_pc == Some(start_pc) && is_pure_poll_loop(&ops) {
+        // HLE hosts may be waiting for wall-clock input. A clocked machine
+        // advances its devices when its CPU budget expires and benefits from
+        // executing a poll as an ordinary budget-limited native loop.
+        // Only the recorded taken path is a wait: the fall-through path may
+        // have ended at an unsupported opcode.
+        if !cfg!(all(feature = "jit-poll-loops", not(target_family = "wasm")))
+            && recorded_exit_pc == Some(start_pc)
+            && is_pure_poll_loop(&ops)
+        {
             return Err(RegionRejectReason::WaitLoop);
         }
 
@@ -22607,6 +22602,7 @@ mod portable_tests {
     #[cfg(all(
         feature = "jit",
         feature = "trace-profile",
+        not(feature = "jit-poll-loops"),
         not(target_family = "wasm")
     ))]
     #[test]
@@ -22705,6 +22701,7 @@ mod portable_tests {
     #[cfg(all(
         feature = "jit",
         feature = "trace-profile",
+        not(feature = "jit-poll-loops"),
         not(target_family = "wasm")
     ))]
     #[test]
@@ -22881,6 +22878,7 @@ mod portable_tests {
     #[cfg(all(
         feature = "jit",
         feature = "trace-profile",
+        not(feature = "jit-poll-loops"),
         not(target_family = "wasm")
     ))]
     #[test]
@@ -22963,6 +22961,42 @@ mod portable_tests {
             !report.contains("backend"),
             "a classified wait is not attributed to the compiler backend"
         );
+    }
+
+    #[cfg(all(feature = "jit-poll-loops", not(target_family = "wasm")))]
+    #[test]
+    fn native_poll_respects_budget_watches_and_changed_operand() {
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        bus.write_word(0x0100, 0xB26D); // CMP.W (-16,A5),D1
+        bus.write_word(0x0102, 0xFFF0);
+        bus.write_word(0x0104, 0x67FA); // BEQ.S back to the compare
+        bus.write_word(0x0300, 0x1234);
+        let mut cpu = cpu();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_a(5, 0x0310);
+        cpu.set_d(1, 0x1234);
+        cpu.pc = 0x0100;
+
+        let result = cpu.run_batch(&mut bus, 20_001, &[]);
+        assert_eq!(result.instructions, 20_001);
+        assert_eq!(cpu.pc, 0x0104);
+        #[cfg(feature = "trace-profile")]
+        assert!(
+            super::super::trace_profile::snapshot()
+                .rows
+                .iter()
+                .any(|row| { row.start_pc == 0x0100 && row.jit_retired > 0 })
+        );
+
+        // Resume at the branch and stop at its next interior occurrence.
+        let result = cpu.run_batch(&mut bus, 100, &[0x0104]);
+        assert_eq!(result.instructions, 2);
+        assert_eq!(cpu.pc, 0x0104);
+        bus.write_word(0x0300, 0x1235);
+        let result = cpu.run_batch(&mut bus, 100, &[0x0106]);
+        assert_eq!(result.instructions, 3);
+        assert_eq!(cpu.pc, 0x0106);
+        assert!(!cpu.test_condition(7));
     }
 
     #[test]

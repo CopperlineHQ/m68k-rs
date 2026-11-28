@@ -39,6 +39,8 @@ jit = [
     "dep:cranelift-module",
     "dep:cranelift-native",
 ]
+# Compile polling loops for emulators that advance hardware on a guest budget.
+jit-poll-loops = ["jit"]
 # Serialize the complete architectural CPU state for deterministic save states.
 # Runtime-only decode, FastMem, and JIT caches are rebuilt after deserialization.
 serde = ["dep:serde", "dep:serde-big-array"]
